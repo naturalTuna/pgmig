@@ -1,0 +1,34 @@
+# pgmig 테스트용 설정 (test/oracle/01_oracle_testdata.sql 로 만든 스키마 기준)
+#   cp conf/pgmig.conf.oracle-test conf/pgmig.conf ; chmod 600 conf/pgmig.conf
+#   <...> 부분만 바꾸면 됨
+
+# ---- target PostgreSQL (oracle_fdw 가 설치된 서버) ----
+PGHOST=/tmp
+PGPORT=5432
+PGDATABASE=<테스트용 DB 이름, 예: migtest>
+PGUSER=postgres
+#PGPASSWORD=
+
+# ---- source Oracle ----
+SRC_TYPE=oracle
+SRC_DBSERVER='//<오라클 IP>:1521/<PDB 서비스명, 예: FREEPDB1>'
+SRC_USER=PGMIG_READER
+SRC_PASSWORD='Pgmig_2026'
+SRC_SCHEMAS='PGMIG_SRC,PGMIG_REF'            # PGMIG_EXT 는 일부러 뺌 (참조 실패 케이스)
+SCHEMA_MAP='PGMIG_SRC:app,PGMIG_REF:ref'     # target 스키마 이름 바꾸기 테스트
+EXCLUDE_TABLES='PGMIG_SRC.TMP_%'             # TMP_BACKUP_EMP 제외 테스트
+
+# ---- 실행 ----
+JOBS=4
+CHUNK_ROWS=50000          # ORDERS(30만건)가 여러 청크로 나뉘게
+VERIFY_MODE=full
+PROGRESS_SEC=5
+
+# ---- oracle 옵션 ----
+ORA_DICT=dba              # PGMIG_READER 에 SELECT ANY DICTIONARY 줬으므로 dba 사용
+ORA_USE_SCN=off
+ORA_PREFETCH=1000
+ORA_MAX_LONG=32767
+ORA_STRIP_ZEROS=off       # 처음엔 off -> NULL_CHAR 청크 실패 확인 -> on 으로 바꾸고 data 재실행
+ORA_PARTITIONS=on
+ORA_ISOLATION_LEVEL=serializable

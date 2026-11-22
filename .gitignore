@@ -1,0 +1,4 @@
+conf/pgmig.conf
+pgmig_report_*
+pgmig_final_report_*
+*_manual/

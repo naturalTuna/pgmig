@@ -1,0 +1,41 @@
+# pgmig 설정 (bash 문법). 실행할 때마다 다시 읽음 -> 값 고치고 같은 명령 다시 실행하면 적용. 복사해서 conf/pgmig.conf 로 저장. 비밀번호가 들어가니 chmod 600
+
+# ---- target PostgreSQL (psql 표준 환경변수. superuser 로 접속) ----
+PGHOST=/tmp
+PGPORT=5432
+PGDATABASE=experdb
+PGUSER=postgres
+#PGPASSWORD=
+
+# ---- source ----
+SRC_TYPE=oracle                       # oracle | postgres(selftest 용)
+SRC_DBSERVER='//10.0.0.5:1521/ORCL'   # oracle 접속 문자열 (EZConnect 또는 tnsnames 별칭)
+SRC_USER=system
+SRC_PASSWORD='change_me'
+SRC_SCHEMAS='HR,SCOTT'                # 이관할 소스 스키마. 오라클은 대문자
+#SCHEMA_MAP='HR:hr_new'               # target 스키마 이름을 바꿀 때만 (기본: 소문자로)
+#EXCLUDE_TABLES='HR.TMP_%,HR.BACKUP_%' # 제외할 테이블 (SCHEMA.TABLE, LIKE 패턴)
+
+# postgres 소스일 때만
+#SRC_PG_HOST=localhost
+#SRC_PG_PORT=5432
+#SRC_PG_DBNAME=srcdb
+
+# ---- 실행 ----
+JOBS=4                 # 병렬 세션 수 (이관/인덱스/검증 공통)
+CHUNK_ROWS=500000      # 숫자 단일 PK 테이블을 이 행 수 단위로 쪼갬
+#CHUNK_ALWAYS_COUNT=on # 소스 통계(num_rows)를 못 믿을 때: 항상 실제 count 로 청크 계산
+VERIFY_MODE=full       # full = 건수 + 전 컬럼 해시 (소스를 한 번 더 읽음) / count = 건수만
+PROGRESS_SEC=5
+
+# ---- oracle 옵션 ----
+ORA_DICT=all           # all = ALL_* 뷰 / dba = DBA_* 뷰 (SELECT ANY DICTIONARY 필요)
+ORA_USE_SCN=off        # on = 모든 청크를 같은 SCN 시점으로 읽음 (flashback query).
+                       #      소스가 운영 중일 때 일관성 확보용. FLASHBACK 권한 + undo 보존 필요
+#ORA_SCN=              # SCN 을 직접 지정할 때
+ORA_PREFETCH=1000      # 한 번에 가져오는 행 수 (1~10240)
+#ORA_LOB_PREFETCH=     # LOB 선행 fetch 바이트 (oracle_fdw 가 지원하는 버전에서만)
+ORA_MAX_LONG=32767     # LONG / LONG RAW / XMLTYPE 최대 길이. 넘으면 에러로 멈춤 (조용히 안 잘림)
+ORA_STRIP_ZEROS=off    # on = 문자열 안의 0x00 문자를 제거하고 이관 (데이터가 바뀌는 것이므로 기본 off)
+ORA_PARTITIONS=on      # on = 오라클 파티션 정의를 PostgreSQL 선언적 파티션으로 생성 / off = 일반 테이블로
+ORA_ISOLATION_LEVEL=serializable
