@@ -181,7 +181,34 @@ test/oracle/                    실제 오라클로 하는 테스트 (데이터 
 시퀀스 값은 analyze 시점 기준 -> 소스 서비스 중지 후 analyze 할 것
 
 
-6. 테스트 상태 (솔직하게)
+6. 다른 도구와 비교
+---------------------------------------------------------------------
+[실측] pgloader 3.6.7 과 PostgreSQL -> PostgreSQL (같은 서버, PG16, JOBS/workers=4)
+  데이터: orders 100만 / skew 30만(PK 치우침) / events 25만(복합 PK) / textpk 25만(문자 PK)
+  재현: bash bench/compare_pgloader.sh   (결과: bench/result.txt)
+
+                         pgmig                      pgloader
+  이관 시간              5.36초 (install~index)     8.28초
+  검증                   3.23초 (건수 + 전 컬럼 해시)  없음
+  원본 대비 행 해시      4개 테이블 일치             4개 테이블 일치
+  타입 보존              varchar(50) 유지            varchar(50) -> text (기본 캐스팅 규칙)
+  타깃 변조 3건 후       verify 가 불일치 청크 3개 지목, 없음 (변조 그대로)
+                         repair 3.36초로 그 청크만 복구 -> 원본과 일치
+                                                     복구하려면 전체 재적재
+  기타                   -                           1회 COPY 도중 멈춤 관찰 (재시도 시 정상)
+  * 같은 서버 안의 FDW 라 pgmig 에 유리한 조건. 실제 Oracle -> PG 는 네트워크/oracle_fdw 속도가 좌우
+
+[기능 비교 - 실측 못 한 것: 이 환경에 Oracle 없음]
+  ora2pg              사실상 표준. PL/SQL 변환 시도, 이관 비용 산정 리포트, 병렬, 데이터 비교 테스트.
+                      pgmig 는 PL/SQL 을 목록/가이드로만 넘김 -> 코드 변환은 ora2pg 쪽이 강함
+  ora_migrator        (CYBERTEC) pgmig 와 같은 구조 (oracle_fdw + PG 안의 staging). 증분(incremental) 이관 지원
+                      -> pgmig 는 CDC/증분 없음 = 다운타임이 전체 이관 시간
+  AWS SCT + DMS       CDC 포함, 클라우드 전제
+  pgmig 강점          청크 단위 검증 -> diff(PK 지목) -> repair -> cleanup 게이트 로 이어지는 정합성 루프,
+                      bash + psql 만 (폐쇄망), 끝나면 툴 흔적 제거
+
+
+7. 테스트 상태 (솔직하게)
 ---------------------------------------------------------------------
 검증된 것
   - test/selftest.sh (PG16 + postgres_fdw) 37개 항목 통과
