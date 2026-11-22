@@ -1,0 +1,10 @@
+pgloader 전체 : 8.28초 (검증 없음)
+pgmig 이관   : 5.36초 (install~index)
+pgmig 검증   : 3.23초 (full: 건수 + 전 컬럼 해시)
+pgmig    원본 해시 일치
+pgloader 원본 해시 일치
+타입 (amount, memo): 원본=numeric(12,2), character varying(50) / pgmig=numeric(12,2), character varying(50) / pgloader=numeric(12,2), text
+pgmig 변조 탐지: 불일치 청크 3개
+pgmig repair : 3.36초 (불일치 청크만)
+pgmig    repair 후 원본 일치
+pgloader 변조 그대로 (검증 기능 없음, 복구 = 전체 재적재)

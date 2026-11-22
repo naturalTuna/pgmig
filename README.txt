@@ -81,7 +81,11 @@ test/oracle/                    실제 오라클로 하는 테스트 (데이터 
 4. 정합성을 어떻게 보장하나
 ---------------------------------------------------------------------
 (1) 청크 = 이관/검증/재이관의 단위
-    숫자 단일 PK 테이블은 CHUNK_ROWS 단위 범위로 쪼개고, 나머지는 테이블 통째로 1청크.
+    숫자 PK (단일, 또는 복합 PK 의 숫자 선두 컬럼) 테이블은 CHUNK_ROWS 단위 범위로 쪼개고,
+    나머지는 테이블 통째로 1청크 (CHUNK_ROWS x 2 보다 크면 analyze/schema 단계에서 WARN).
+    경계값은 CHUNK_SPLIT=quantile(기본) 이면 소스에서 PK 분위수(NTILE)로 정함
+      -> ID 가 1~29000 + 1조 근처처럼 치우쳐도 청크 크기가 고름 (균등 분할이면 한 청크에 몰림)
+      -> 소스에서 PK 를 한 번 정렬해 읽는 비용이 있음. 싫으면 CHUNK_SPLIT=uniform (예전 방식)
     첫 청크는 하한 없음 / 마지막 청크는 상한 없음 -> 범위 밖 값 누락 없음.
     청크 조건은 FDW 가 소스로 push down 하는 형태로 만들어서 청크마다 자기 범위만 읽음.
 
@@ -114,6 +118,10 @@ test/oracle/                    실제 오라클로 하는 테스트 (데이터 
       FDW 의 타입 변환 자체가 틀린 경우(예: 문자셋 변환)는 같은 값으로 보임
       -> 한글/특수문자 컬럼은 소스 툴(sqlplus)로 몇 건 직접 눈으로 대조 권장
     - PK 없는 테이블은 청크 분할/diff 불가 (통째로 이관·검증·재이관)
+    - 문자 PK(VARCHAR2 등) 테이블도 1청크. 오라클 정렬(NLS)과 PG collation 이 달라
+      청크 경계가 양쪽에서 다르게 잘릴 수 있어 아직 분할하지 않음 (대형이면 WARN)
+    - repair 는 FK/트리거를 끈 상태(session_replication_role=replica)로 지웠다 다시 넣음
+      -> 끝나고 관련 FK 의 고아 행을 자동 검사해서 있으면 WARN + 이슈 기록 (차단은 안 함)
 
 
 5. Oracle 지원 범위
@@ -173,12 +181,41 @@ test/oracle/                    실제 오라클로 하는 테스트 (데이터 
 시퀀스 값은 analyze 시점 기준 -> 소스 서비스 중지 후 analyze 할 것
 
 
-6. 테스트 상태 (솔직하게)
+6. 다른 도구와 비교
+---------------------------------------------------------------------
+[실측] pgloader 3.6.7 과 PostgreSQL -> PostgreSQL (같은 서버, PG16, JOBS/workers=4)
+  데이터: orders 100만 / skew 30만(PK 치우침) / events 25만(복합 PK) / textpk 25만(문자 PK)
+  재현: bash bench/compare_pgloader.sh   (결과: bench/result.txt)
+
+                         pgmig                      pgloader
+  이관 시간              5.36초 (install~index)     8.28초
+  검증                   3.23초 (건수 + 전 컬럼 해시)  없음
+  원본 대비 행 해시      4개 테이블 일치             4개 테이블 일치
+  타입 보존              varchar(50) 유지            varchar(50) -> text (기본 캐스팅 규칙)
+  타깃 변조 3건 후       verify 가 불일치 청크 3개 지목, 없음 (변조 그대로)
+                         repair 3.36초로 그 청크만 복구 -> 원본과 일치
+                                                     복구하려면 전체 재적재
+  기타                   -                           1회 COPY 도중 멈춤 관찰 (재시도 시 정상)
+  * 같은 서버 안의 FDW 라 pgmig 에 유리한 조건. 실제 Oracle -> PG 는 네트워크/oracle_fdw 속도가 좌우
+
+[기능 비교 - 실측 못 한 것: 이 환경에 Oracle 없음]
+  ora2pg              사실상 표준. PL/SQL 변환 시도, 이관 비용 산정 리포트, 병렬, 데이터 비교 테스트.
+                      pgmig 는 PL/SQL 을 목록/가이드로만 넘김 -> 코드 변환은 ora2pg 쪽이 강함
+  ora_migrator        (CYBERTEC) pgmig 와 같은 구조 (oracle_fdw + PG 안의 staging). 증분(incremental) 이관 지원
+                      -> pgmig 는 CDC/증분 없음 = 다운타임이 전체 이관 시간
+  AWS SCT + DMS       CDC 포함, 클라우드 전제
+  pgmig 강점          청크 단위 검증 -> diff(PK 지목) -> repair -> cleanup 게이트 로 이어지는 정합성 루프,
+                      bash + psql 만 (폐쇄망), 끝나면 툴 흔적 제거
+
+
+7. 테스트 상태 (솔직하게)
 ---------------------------------------------------------------------
 검증된 것
-  - test/selftest.sh (PG16 + postgres_fdw) 28개 항목 통과
+  - test/selftest.sh (PG16 + postgres_fdw) 37개 항목 통과
       install ~ cleanup 전체 흐름, 병렬 청크 이관, count/full 검증, 누락·변조·초과 탐지,
-      diff, repair, 중단된 청크 재시도, cleanup 게이트
+      diff, repair, 중단된 청크 재시도, cleanup 게이트,
+      PK 치우침 분위수 분할(최대 청크 29000 -> 10000행), 복합 PK 선두 컬럼 분할,
+      문자 PK 대형 테이블 WARN, repair 후 FK 고아 행 검출
   - test/mock_oracle/run_mock.sh : test/oracle 데이터와 같은 모양의 가짜 오라클 딕셔너리로
       타입 매핑, 파티션 DDL 과 실제 행 라우팅, 뷰 변환/의존 재시도, default/시퀀스/identity,
       실패 DDL 가이드, 수동 작업 폴더, resolved / 수동 생성 뷰 감지
@@ -188,7 +225,7 @@ test/oracle/                    실제 오라클로 하는 테스트 (데이터 
   -> test/oracle/README_TEST.txt 순서대로 한 번 돌려보고, 기대와 다른 출력이 있으면 그대로 공유
 
 
-7. 소스 DB 추가하는 법 (DB2, MSSQL, MySQL ...)
+8. 소스 DB 추가하는 법 (DB2, MSSQL, MySQL ...)
 ---------------------------------------------------------------------
 sql/src_<type>.sql 에 아래 4개만 구현하면 core 는 그대로 씀.
   PROCEDURE pgmig.src_<type>_catalog()                   pgmig.tables/columns/constraints/indexes/sequences/

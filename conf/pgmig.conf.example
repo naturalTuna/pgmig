@@ -23,7 +23,9 @@ SRC_SCHEMAS='HR,SCOTT'                # 이관할 소스 스키마. 오라클은
 
 # ---- 실행 ----
 JOBS=4                 # 병렬 세션 수 (이관/인덱스/검증 공통)
-CHUNK_ROWS=500000      # 숫자 단일 PK 테이블을 이 행 수 단위로 쪼갬
+CHUNK_ROWS=500000      # 숫자 PK(단일 또는 복합 PK 의 숫자 선두 컬럼) 테이블을 이 행 수 단위로 쪼갬
+#CHUNK_SPLIT=quantile  # quantile(기본) = 소스 PK 분위수로 경계 (ID 가 치우쳐도 청크 크기 균일)
+                       # uniform = (max-min)/n 균등 분할 (소스에서 PK 정렬 1회도 아끼고 싶을 때)
 #CHUNK_ALWAYS_COUNT=on # 소스 통계(num_rows)를 못 믿을 때: 항상 실제 count 로 청크 계산
 VERIFY_MODE=full       # full = 건수 + 전 컬럼 해시 (소스를 한 번 더 읽음) / count = 건수만
 PROGRESS_SEC=5

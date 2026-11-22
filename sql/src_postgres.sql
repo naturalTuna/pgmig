@@ -90,3 +90,17 @@ BEGIN
   EXECUTE format('SELECT count(*) FROM pgmig_stage.%I WHERE %s', 't' || p_table, pgmig.cond(p_pk, p_lo, p_hi)) INTO r;
   RETURN r;
 END $$;
+
+-- 분위수 경계 (NTILE): n 개 버킷의 시작값 중 첫 번째를 뺀 n-1 개 (오름차순, 중복 제거)
+--   postgres_fdw 는 윈도 함수를 push down 하지 않아 PK 컬럼만 읽어와서 계산 (selftest 규모 전제)
+CREATE FUNCTION pgmig.src_postgres_bounds(p_table int, p_pk text, p_n int) RETURNS numeric[]
+LANGUAGE plpgsql AS $$
+DECLARE
+  r numeric[];
+BEGIN
+  EXECUTE format('SELECT array_agg(b ORDER BY b) FROM (SELECT DISTINCT min(%1$I)::numeric AS b
+                    FROM (SELECT %1$I, ntile($1) OVER (ORDER BY %1$I) AS t FROM pgmig_stage.%2$I) s
+                   GROUP BY t) x', p_pk, 't' || p_table)
+    USING p_n INTO r;
+  RETURN r[2:];
+END $$;

@@ -5,6 +5,7 @@
 #   필요한 것: bash, psql  (target 서버에 해당 FDW 가 설치되어 있어야 함)
 # =====================================================================
 set -euo pipefail
+umask 077   # 리포트 / 수동작업 / 임시 파일은 실행 계정만 읽기 (스키마 구조·오류 메시지 포함)
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONF="${PGMIG_CONF:-$BASE/conf/pgmig.conf}"
@@ -63,6 +64,7 @@ need_installed() { installed || die "pgmig 미설치. 먼저: $(basename "$0") i
 # conf 파일의 조정 가능한 값을 매 명령마다 DB(pgmig.config) 에 반영 -> conf 고치고 다시 실행하면 적용됨
 #   (src_type/서버 접속정보는 install 때만. ORA_SCN 은 비어 있으면 자동으로 잡은 값을 유지)
 CONF_KEYS=(schemas:SRC_SCHEMAS schema_map:SCHEMA_MAP exclude_tables:EXCLUDE_TABLES chunk_rows:CHUNK_ROWS
+           chunk_split:CHUNK_SPLIT
            chunk_always_count:CHUNK_ALWAYS_COUNT ora_dict:ORA_DICT ora_use_scn:ORA_USE_SCN ora_prefetch:ORA_PREFETCH
            ora_lob_prefetch:ORA_LOB_PREFETCH ora_max_long:ORA_MAX_LONG ora_strip_zeros:ORA_STRIP_ZEROS
            ora_partitions:ORA_PARTITIONS)
@@ -258,7 +260,8 @@ cmd_diff() {
 
 cmd_repair() {
   need_installed
-  local n
+  local n ids
+  ids=$(q "SELECT coalesce(string_agg(DISTINCT table_id::text, ','), '') FROM pgmig.tasks WHERE status = 'done' AND v_status = 'mismatch'")
   n=$(q "WITH u AS (UPDATE pgmig.tasks SET status = 'pending', redo = true WHERE status = 'done' AND v_status = 'mismatch' RETURNING 1) SELECT count(*) FROM u")
   if [ "$n" = "0" ]; then log "불일치 청크 없음"; return 0; fi
   log "불일치 청크 ${n}개 재이관 (해당 범위 삭제 후 다시 적재)"
@@ -266,6 +269,19 @@ cmd_repair() {
   q "CALL pgmig.make_stage(true)"
   run_workers "CALL pgmig.worker()" "$PROG_DATA"
   q "UPDATE pgmig.tasks SET v_status = 'pending' WHERE status = 'done' AND v_status IS NULL" >/dev/null
+  # repair 는 FK/트리거를 끄고(session_replication_role=replica) 지웠다 넣으므로 고아 행 검사
+  local orph
+  orph=$(q "SELECT coalesce(string_agg(format('%s: %s -> %s 고아 %s행', fk, child, parent, orphans), E'\n'), '')
+              FROM pgmig.fk_orphans('{${ids}}'::int[]) WHERE orphans > 0")
+  if [ -n "$orph" ]; then
+    log "WARN FK 고아 행 발견 (재이관 중 소스에서 부모 행이 바뀐 경우 등) — 확인 필요:"
+    printf '%s\n' "$orph" | sed 's/^/    /'
+    printf '%s\n' "$orph" | while IFS= read -r line; do
+      q "INSERT INTO pgmig.issues (level, object, msg) VALUES ('WARN', 'repair', $(printf "%s" "$line" | sed "s/'/''/g; s/^/'/; s/$/'/"))" >/dev/null
+    done
+  elif [ -n "$ids" ]; then
+    log "FK 고아 행 없음 (재이관 테이블 관련 FK 검사)"
+  fi
   log "재이관한 청크 재검증 (mode=$VERIFY_MODE)"
   do_verify "$VERIFY_MODE"
 }
@@ -405,6 +421,7 @@ cmd_cleanup() {
   ext_created=$(q "SELECT pgmig.cfg('ext_created', 'no')")
   [[ "$ext" =~ ^[a-z_]+$ ]] || die "config 의 ext 값이 이상함: $ext"
   log "pgmig 제거 (한 트랜잭션. 사용자 객체가 foreign table 을 참조하고 있으면 전체 롤백)"
+  local errf; errf=$(mktemp)
   {
     cat <<'EOF'
 DO $$
@@ -422,8 +439,8 @@ DROP SERVER pgmig_src CASCADE;
 EOF
     # 이 툴이 만든 확장만 제거 (다른 객체가 쓰고 있으면 에러 -> 롤백)
     if [ "$ext_created" = yes ]; then echo "DROP EXTENSION $ext;"; fi
-  } | "${PSQL[@]}" -1 -f - >/dev/null 2>/tmp/pgmig_cleanup.$$ || { cat /tmp/pgmig_cleanup.$$ >&2; rm -f /tmp/pgmig_cleanup.$$; die "제거 실패 (롤백됨)"; }
-  rm -f /tmp/pgmig_cleanup.$$
+  } | "${PSQL[@]}" -1 -f - >/dev/null 2>"$errf" || { cat "$errf" >&2; rm -f "$errf"; die "제거 실패 (롤백됨)"; }
+  rm -f "$errf"
   log "제거 완료. 남은 흔적 확인:"
   qt "SELECT (SELECT count(*) FROM pg_namespace WHERE nspname LIKE 'pgmig%') AS schemas,
              (SELECT count(*) FROM pg_foreign_server WHERE srvname = 'pgmig_src') AS servers,
