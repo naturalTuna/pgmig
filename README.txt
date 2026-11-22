@@ -225,7 +225,7 @@ test/oracle/                    실제 오라클로 하는 테스트 (데이터 
   -> test/oracle/README_TEST.txt 순서대로 한 번 돌려보고, 기대와 다른 출력이 있으면 그대로 공유
 
 
-7. 소스 DB 추가하는 법 (DB2, MSSQL, MySQL ...)
+8. 소스 DB 추가하는 법 (DB2, MSSQL, MySQL ...)
 ---------------------------------------------------------------------
 sql/src_<type>.sql 에 아래 4개만 구현하면 core 는 그대로 씀.
   PROCEDURE pgmig.src_<type>_catalog()                   pgmig.tables/columns/constraints/indexes/sequences/
