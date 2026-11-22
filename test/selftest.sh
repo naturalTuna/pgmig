@@ -39,6 +39,16 @@ INSERT INTO app.pairs SELECT g % 50, g, g * 1.5 FROM generate_series(1, 2000) g;
 CREATE TABLE app.empty_t (id int PRIMARY KEY, t text);
 CREATE TABLE app.arr (id int PRIMARY KEY, tags int[]);
 INSERT INTO app.arr VALUES (1, '{1,2}');
+-- PK 값이 한쪽으로 몰린 테이블: 1..29000 + 1조 근처 1000개 (균등 분할이면 한 청크에 29000행이 몰림)
+CREATE TABLE app.skew (id bigint PRIMARY KEY, v text);
+INSERT INTO app.skew SELECT g, 's' || g FROM generate_series(1, 29000) g;
+INSERT INTO app.skew SELECT 1000000000000 + g, 's' || g FROM generate_series(1, 1000) g;
+-- 복합 PK (숫자 선두 컬럼) — 선두 컬럼으로 분할
+CREATE TABLE app.events (dev int, seq int, val text, PRIMARY KEY (dev, seq));
+INSERT INTO app.events SELECT g % 50, g, 'e' || g FROM generate_series(1, 25000) g;
+-- 문자 PK 대형 테이블 — 1청크, WARN 대상
+CREATE TABLE app.textpk (code varchar(20) PRIMARY KEY, v int);
+INSERT INTO app.textpk SELECT 'C' || lpad(g::text, 8, '0'), g FROM generate_series(1, 25000) g;
 SQL
 
 cat >"$WORK/pgmig.conf" <<CONF
@@ -62,7 +72,7 @@ cd "$WORK"
 echo "== install / analyze =="
 "$M" install
 "$M" analyze
-check "이관 대상 테이블 수" "$(tq "SELECT count(*) FROM pgmig.tables WHERE migrate")" 7
+check "이관 대상 테이블 수" "$(tq "SELECT count(*) FROM pgmig.tables WHERE migrate")" 10
 check "미지원 타입(배열) 테이블 제외" "$(tq "SELECT migrate FROM pgmig.tables WHERE src_table = 'arr'")" f
 check "PK 없는 테이블 경고" "$(tq "SELECT count(*) FROM pgmig.issues WHERE level = 'WARN' AND object = 'app.nopk'")" 1
 
@@ -82,13 +92,20 @@ tq "INSERT INTO pgmig.indexes (table_id, name, is_unique, cols, descs)
 echo "== schema / data =="
 "$M" schema
 check "orders 청크 수" "$(tq "SELECT count(*) FROM pgmig.tasks k JOIN pgmig.tables t ON t.id = k.table_id WHERE t.src_table = 'orders'")" 10
+check "skew 청크 수 (분위수 분할)" "$(tq "SELECT count(*) FROM pgmig.tasks k JOIN pgmig.tables t ON t.id = k.table_id WHERE t.src_table = 'skew'")" 3
+check "events 청크 수 (복합 PK 선두 컬럼 분할)" "$(tq "SELECT count(*) FROM pgmig.tasks k JOIN pgmig.tables t ON t.id = k.table_id WHERE t.src_table = 'events'")" 3
+check "문자 PK 대형 테이블 1청크 경고" "$(tq "SELECT count(*) FROM pgmig.issues WHERE level = 'WARN' AND object = 'app.textpk' AND msg LIKE '%1청크%'")" 1
 "$M" data
 check "orders 적재 건수" "$(tq "SELECT count(*) FROM app_new.orders")" 100000
+SKEW_MAX=$(tq "SELECT max(n) FROM (SELECT (SELECT count(*) FROM app_new.skew s WHERE (k.lo IS NULL OR s.id >= k.lo) AND (k.hi IS NULL OR s.id < k.hi)) n
+                FROM pgmig.tasks k JOIN pgmig.tables t ON t.id = k.table_id WHERE t.src_table = 'skew') x")
+[ "$SKEW_MAX" -le 11000 ] && ok "skew 청크 최대 ${SKEW_MAX}행 (균등 분할이면 29000)" || bad "skew 청크 불균형: 최대 ${SKEW_MAX}행"
+check "events 적재 건수" "$(tq "SELECT count(*) FROM app_new.events")" 25000
 check "대소문자 혼용 이름 유지" "$(tq "SELECT count(*) FROM app_new.\"MixedCase\" WHERE \"Val\" IS NOT NULL")" 300
 
 echo "== index / verify / fk =="
 "$M" index
-check "PK 생성" "$(tq "SELECT count(*) FROM pg_constraint WHERE contype = 'p' AND connamespace = 'app_new'::regnamespace")" 6
+check "PK 생성" "$(tq "SELECT count(*) FROM pg_constraint WHERE contype = 'p' AND connamespace = 'app_new'::regnamespace")" 9
 check "인덱스(DESC) 생성" "$(tq "SELECT count(*) FROM pg_indexes WHERE indexname = 'orders_cust_created_ix' AND indexdef LIKE '%created DESC%'")" 1
 check "시퀀스 다음 값" "$(tq "SELECT nextval('app_new.order_seq')")" 300001
 check "실패 DDL 은 기록만 하고 진행" "$(tq "SELECT count(*) FROM pgmig.ddl WHERE status = 'failed' AND object LIKE '%orders_bad_ck'")" 1
@@ -117,6 +134,21 @@ echo "== repair =="
 check "repair 후 전 청크 OK" "$(tq "SELECT count(*) FROM pgmig.tasks WHERE v_status IS DISTINCT FROM 'ok'")" 0
 check "repair 후 orders 건수" "$(tq "SELECT count(*) FROM app_new.orders")" 100000
 check "repair 후 nopk 건수" "$(tq "SELECT count(*) FROM app_new.nopk")" 5000
+
+echo "== repair 후 FK 고아 행 검사 =="
+# 소스에서 부모(customers 5) 삭제 → 타깃 customers 청크 불일치 → repair(FK 끈 상태로 재적재) → 자식 orders 가 고아
+"${P[@]}" -d pgmig_st_src -c "DELETE FROM app.customers WHERE id = 5"
+"$M" verify full >/dev/null 2>&1 || true
+"$M" repair > "$WORK/repair_fk.log" 2>&1 || true
+grep -q "FK 고아 행 발견" "$WORK/repair_fk.log" && ok "repair 후 FK 고아 행 경고" || { bad "FK 고아 경고 없음"; cat "$WORK/repair_fk.log"; }
+check "고아 행 수 (cust=5 인 orders)" "$(tq "SELECT orphans FROM pgmig.fk_orphans(ARRAY(SELECT id FROM pgmig.tables WHERE src_table = 'customers')) WHERE fk = 'orders_cust_fk'")" \
+      "$("${P[@]}" -d pgmig_st_tgt -At -c "SELECT count(*) FROM app_new.orders WHERE cust = 5")"
+check "고아 경고가 이슈로 기록" "$(tq "SELECT count(*) FROM pgmig.issues WHERE level = 'WARN' AND object = 'repair' AND msg LIKE 'orders_cust_fk%'")" 1
+# 원상복구: 소스에 다시 넣고 repair → 고아 없음
+"${P[@]}" -d pgmig_st_src -c "INSERT INTO app.customers VALUES (5, 'cust5')"
+"$M" verify full >/dev/null 2>&1 || true
+"$M" repair > "$WORK/repair_fk2.log" 2>&1
+grep -q "FK 고아 행 없음" "$WORK/repair_fk2.log" && ok "부모 복구 후 고아 없음" || bad "복구 후에도 고아"
 
 echo "== 중단된 청크(세션 죽음 = 적재 롤백 + running 상태로 남음) 재시도 =="
 tq "TRUNCATE app_new.codes;

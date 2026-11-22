@@ -281,6 +281,26 @@ BEGIN
   RETURN r;
 END $$;
 
+-- 분위수 경계: 오라클에서 NTILE 로 계산해 경계값만 가져옴 (PK 인덱스 1회 정렬 스캔)
+--   ORA_USE_SCN 이면 같은 SCN 기준. n 개 버킷 시작값 중 첫 번째를 뺀 값들
+CREATE FUNCTION pgmig.src_oracle_bounds(p_table int, p_pk text, p_n int) RETURNS numeric[]
+LANGUAGE plpgsql AS $$
+DECLARE
+  c   text := pgmig.ora_src_col(p_table, p_pk);
+  nm  text := 'qb_' || pg_backend_pid();
+  q   text;
+  r   numeric[];
+BEGIN
+  q := format('SELECT MIN(%1$s) AS b FROM (SELECT %1$s, NTILE(%2$s) OVER (ORDER BY %1$s) AS t FROM %3$s) GROUP BY t',
+              c, p_n, pgmig.ora_from(p_table));
+  EXECUTE format('DROP FOREIGN TABLE IF EXISTS pgmig_stage.%I', nm);
+  EXECUTE format('CREATE FOREIGN TABLE pgmig_stage.%I (b numeric) SERVER pgmig_src OPTIONS (table %L, readonly ''true'')',
+                 nm, '(' || q || ')');
+  EXECUTE format('SELECT array_agg(DISTINCT b ORDER BY b) FROM pgmig_stage.%I', nm) INTO r;
+  EXECUTE format('DROP FOREIGN TABLE pgmig_stage.%I', nm);
+  RETURN r[2:];
+END $$;
+
 -- stage foreign table DDL (컬럼은 column_id 순서 = oracle_fdw 매칭 순서)
 CREATE FUNCTION pgmig.src_oracle_stage_sql(p_table int) RETURNS text LANGUAGE plpgsql AS $$
 DECLARE

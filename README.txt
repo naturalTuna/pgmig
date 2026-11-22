@@ -81,7 +81,11 @@ test/oracle/                    실제 오라클로 하는 테스트 (데이터 
 4. 정합성을 어떻게 보장하나
 ---------------------------------------------------------------------
 (1) 청크 = 이관/검증/재이관의 단위
-    숫자 단일 PK 테이블은 CHUNK_ROWS 단위 범위로 쪼개고, 나머지는 테이블 통째로 1청크.
+    숫자 PK (단일, 또는 복합 PK 의 숫자 선두 컬럼) 테이블은 CHUNK_ROWS 단위 범위로 쪼개고,
+    나머지는 테이블 통째로 1청크 (CHUNK_ROWS x 2 보다 크면 analyze/schema 단계에서 WARN).
+    경계값은 CHUNK_SPLIT=quantile(기본) 이면 소스에서 PK 분위수(NTILE)로 정함
+      -> ID 가 1~29000 + 1조 근처처럼 치우쳐도 청크 크기가 고름 (균등 분할이면 한 청크에 몰림)
+      -> 소스에서 PK 를 한 번 정렬해 읽는 비용이 있음. 싫으면 CHUNK_SPLIT=uniform (예전 방식)
     첫 청크는 하한 없음 / 마지막 청크는 상한 없음 -> 범위 밖 값 누락 없음.
     청크 조건은 FDW 가 소스로 push down 하는 형태로 만들어서 청크마다 자기 범위만 읽음.
 
@@ -114,6 +118,10 @@ test/oracle/                    실제 오라클로 하는 테스트 (데이터 
       FDW 의 타입 변환 자체가 틀린 경우(예: 문자셋 변환)는 같은 값으로 보임
       -> 한글/특수문자 컬럼은 소스 툴(sqlplus)로 몇 건 직접 눈으로 대조 권장
     - PK 없는 테이블은 청크 분할/diff 불가 (통째로 이관·검증·재이관)
+    - 문자 PK(VARCHAR2 등) 테이블도 1청크. 오라클 정렬(NLS)과 PG collation 이 달라
+      청크 경계가 양쪽에서 다르게 잘릴 수 있어 아직 분할하지 않음 (대형이면 WARN)
+    - repair 는 FK/트리거를 끈 상태(session_replication_role=replica)로 지웠다 다시 넣음
+      -> 끝나고 관련 FK 의 고아 행을 자동 검사해서 있으면 WARN + 이슈 기록 (차단은 안 함)
 
 
 5. Oracle 지원 범위
@@ -176,9 +184,11 @@ test/oracle/                    실제 오라클로 하는 테스트 (데이터 
 6. 테스트 상태 (솔직하게)
 ---------------------------------------------------------------------
 검증된 것
-  - test/selftest.sh (PG16 + postgres_fdw) 28개 항목 통과
+  - test/selftest.sh (PG16 + postgres_fdw) 37개 항목 통과
       install ~ cleanup 전체 흐름, 병렬 청크 이관, count/full 검증, 누락·변조·초과 탐지,
-      diff, repair, 중단된 청크 재시도, cleanup 게이트
+      diff, repair, 중단된 청크 재시도, cleanup 게이트,
+      PK 치우침 분위수 분할(최대 청크 29000 -> 10000행), 복합 PK 선두 컬럼 분할,
+      문자 PK 대형 테이블 WARN, repair 후 FK 고아 행 검출
   - test/mock_oracle/run_mock.sh : test/oracle 데이터와 같은 모양의 가짜 오라클 딕셔너리로
       타입 매핑, 파티션 DDL 과 실제 행 라우팅, 뷰 변환/의존 재시도, default/시퀀스/identity,
       실패 DDL 가이드, 수동 작업 폴더, resolved / 수동 생성 뷰 감지

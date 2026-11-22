@@ -633,31 +633,42 @@ BEGIN
   END LOOP;
 END $$;
 
+-- 청크 계획
+--   숫자 PK(또는 복합 PK 의 숫자 선두 컬럼)로 범위 분할. 첫 청크 하한 / 마지막 청크 상한 없음.
+--   경계값: CHUNK_SPLIT=quantile(기본) 이면 소스에서 PK 분위수(NTILE)로 → ID 가 치우쳐도 청크 크기가 고름
+--           uniform 이거나 플러그인이 지원 안 하면 (max-min)/n 균등 분할 (예전 방식)
+--   숫자 PK 가 없는 큰 테이블은 1청크 → WARN 으로 알림 (병렬 / 부분 재시도 불가)
 CREATE PROCEDURE pgmig.plan_tasks() LANGUAGE plpgsql AS $$
 DECLARE
-  r       record;
-  v_type  text   := pgmig.cfg('src_type');
-  v_chunk bigint := pgmig.cfg('chunk_rows', '500000')::bigint;
-  v_force boolean := pgmig.cfg('chunk_always_count', 'off') = 'on';
-  v_lo    numeric;
-  v_hi    numeric;
-  v_cnt   bigint;
-  n       int;
-  step    numeric;
-  i       int;
+  r        record;
+  v_type   text   := pgmig.cfg('src_type');
+  v_chunk  bigint := pgmig.cfg('chunk_rows', '500000')::bigint;
+  v_force  boolean := pgmig.cfg('chunk_always_count', 'off') = 'on';
+  v_split  text   := lower(pgmig.cfg('chunk_split', 'quantile'));
+  v_lo     numeric;
+  v_hi     numeric;
+  v_cnt    bigint;
+  v_bounds numeric[];
+  n        int;
+  step     numeric;
+  i        int;
 BEGIN
+  IF v_split NOT IN ('quantile', 'uniform') THEN
+    RAISE EXCEPTION 'CHUNK_SPLIT 는 quantile 또는 uniform (현재: %)', v_split;
+  END IF;
   FOR r IN
-    SELECT t.id, t.est_rows,
+    SELECT t.id, t.est_rows, t.src_schema, t.src_table,
            (SELECT c.cols[1]
               FROM pgmig.constraints c
               JOIN pgmig.columns col ON col.table_id = c.table_id AND col.tgt_col = c.cols[1]
-             WHERE c.table_id = t.id AND c.ctype = 'p' AND cardinality(c.cols) = 1
+             WHERE c.table_id = t.id AND c.ctype = 'p'
                AND col.tgt_type ~ '^(smallint|integer|bigint|numeric)' LIMIT 1) AS pk
       FROM pgmig.tables t
      WHERE t.migrate AND NOT EXISTS (SELECT FROM pgmig.tasks k WHERE k.table_id = t.id)
      ORDER BY t.id
   LOOP
     n := 1;
+    v_bounds := NULL;
     IF r.pk IS NOT NULL AND (v_force OR r.est_rows IS NULL OR r.est_rows > v_chunk) THEN
       EXECUTE format('SELECT lo, hi, cnt FROM pgmig.%I($1, $2)', 'src_' || v_type || '_stats')
         USING r.id, r.pk INTO v_lo, v_hi, v_cnt;
@@ -665,11 +676,49 @@ BEGIN
       IF v_cnt > v_chunk AND v_hi > v_lo THEN
         n    := ceil(v_cnt::numeric / v_chunk);
         step := ceil((v_hi - v_lo + 1) / n);
+        IF v_split = 'quantile' THEN
+          BEGIN
+            EXECUTE format('SELECT pgmig.%I($1, $2, $3)', 'src_' || v_type || '_bounds')
+              USING r.id, r.pk, n INTO v_bounds;
+          EXCEPTION WHEN undefined_function THEN
+            v_bounds := NULL;           -- 플러그인 미지원 → 균등 분할
+          WHEN OTHERS THEN
+            v_bounds := NULL;
+            INSERT INTO pgmig.issues (level, object, msg)
+            VALUES ('INFO', r.src_schema || '.' || r.src_table,
+                    '분위수 경계 계산 실패 → 균등 분할로 진행: ' || SQLERRM);
+          END;
+        END IF;
       END IF;
     END IF;
 
-    IF n = 1 THEN
+    IF v_bounds IS NOT NULL AND cardinality(v_bounds) >= 1 THEN
+      -- 경계 b1 < b2 < ... : (-inf,b1) [b1,b2) ... [bk,+inf)
+      n := cardinality(v_bounds) + 1;
+      FOR i IN 1 .. n LOOP
+        INSERT INTO pgmig.tasks (table_id, pk_col, lo, hi)
+        VALUES (r.id, r.pk,
+                CASE WHEN i > 1 THEN v_bounds[i - 1] END,
+                CASE WHEN i < n THEN v_bounds[i] END);
+      END LOOP;
+    ELSIF n = 1 THEN
       INSERT INTO pgmig.tasks (table_id) VALUES (r.id);
+      IF r.pk IS NULL AND r.est_rows IS NULL THEN
+        -- 숫자 PK 가 없고 통계 추정치도 없으면 크기를 한 번 센다 (1청크 대형 테이블 경고용)
+        BEGIN
+          EXECUTE format('SELECT pgmig.%I($1, NULL, NULL, NULL)', 'src_' || v_type || '_count')
+            USING r.id INTO r.est_rows;
+          UPDATE pgmig.tables SET est_rows = r.est_rows WHERE id = r.id;
+        EXCEPTION WHEN OTHERS THEN NULL;
+        END;
+      END IF;
+      IF r.pk IS NULL AND coalesce(r.est_rows, 0) > v_chunk * 2 THEN
+        INSERT INTO pgmig.issues (level, object, msg)
+        VALUES ('WARN', r.src_schema || '.' || r.src_table,
+                format('숫자 PK 가 없어 약 %s행을 1청크(한 트랜잭션)로 이관 — 병렬화 / 부분 재시도 불가. '
+                       '시간·WAL·undo 여유를 확인하고, 가능하면 숫자 PK(또는 숫자 선두 컬럼의 PK) 기준으로 나눌 것',
+                       r.est_rows));
+      END IF;
     ELSE
       -- 첫 청크는 하한 없음, 마지막 청크는 상한 없음 -> min/max 조사 이후 들어온 값도 누락 없음
       FOR i IN 0 .. n - 1 LOOP
@@ -793,6 +842,36 @@ BEGIN
            src_hash = s_hash, tgt_hash = t_hash, v_error = v_err, v_at = clock_timestamp()
      WHERE id = t.id;
     COMMIT;
+  END LOOP;
+END $$;
+
+-- ---------------------------------------------------------------------
+-- FK 고아 행 검사 (repair 는 session_replication_role=replica 로 트리거/FK 를 끄고 지웠다 넣으므로,
+--   그 사이 소스에서 부모 행이 사라졌으면 자식이 고아로 남을 수 있음)
+--   p_tables: 검사할 pgmig.tables id. 이 테이블들이 자식이거나 부모인 FK 를 전부 검사
+-- ---------------------------------------------------------------------
+CREATE FUNCTION pgmig.fk_orphans(p_tables int[])
+RETURNS TABLE (fk text, child text, parent text, orphans bigint) LANGUAGE plpgsql AS $$
+DECLARE
+  r record;
+BEGIN
+  FOR r IN
+    SELECT c.oid, c.conname, c.conrelid::regclass AS ch, c.confrelid::regclass AS pa,
+           (SELECT string_agg(format('c.%I IS NOT NULL', a.attname), ' AND ')
+              FROM unnest(c.conkey) k JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k) AS notnull,
+           (SELECT string_agg(format('p.%I = c.%I', pa.attname, ca.attname), ' AND ')
+              FROM unnest(c.conkey, c.confkey) AS u(ck, pk)
+              JOIN pg_attribute ca ON ca.attrelid = c.conrelid  AND ca.attnum = u.ck
+              JOIN pg_attribute pa ON pa.attrelid = c.confrelid AND pa.attnum = u.pk) AS joincond
+      FROM pg_constraint c
+     WHERE c.contype = 'f'
+       AND (c.conrelid  IN (SELECT to_regclass(pgmig.rel(x)) FROM unnest(p_tables) x)
+         OR c.confrelid IN (SELECT to_regclass(pgmig.rel(x)) FROM unnest(p_tables) x))
+  LOOP
+    fk := r.conname; child := r.ch::text; parent := r.pa::text;
+    EXECUTE format('SELECT count(*) FROM %s c WHERE %s AND NOT EXISTS (SELECT 1 FROM %s p WHERE %s)',
+                   r.ch, r.notnull, r.pa, r.joincond) INTO orphans;
+    RETURN NEXT;
   END LOOP;
 END $$;
 
