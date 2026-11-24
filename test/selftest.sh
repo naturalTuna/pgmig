@@ -49,6 +49,16 @@ INSERT INTO app.events SELECT g % 50, g, 'e' || g FROM generate_series(1, 25000)
 -- 문자 PK 대형 테이블 — 1청크, WARN 대상
 CREATE TABLE app.textpk (code varchar(20) PRIMARY KEY, v int);
 INSERT INTO app.textpk SELECT 'C' || lpad(g::text, 8, '0'), g FROM generate_series(1, 25000) g;
+-- SPLIT_COLS: 문자 PK 대형 테이블을 시각 컬럼으로 분할 (일부 NULL, 밀리초 포함)
+CREATE TABLE app.logs (lid varchar(20) PRIMARY KEY, created timestamp, msg text);
+INSERT INTO app.logs
+SELECT 'L' || lpad(g::text, 8, '0'),
+       CASE WHEN g % 1000 = 0 THEN NULL ELSE timestamp '2024-01-01' + g * interval '1 minute' + (g % 7) * interval '1 millisecond' END,
+       'm' || g
+  FROM generate_series(1, 25000) g;
+-- SPLIT_COLS: PK 없는 대형 테이블을 숫자 컬럼(중복값, NULL 있음)으로 분할
+CREATE TABLE app.meas (grp int, v numeric);
+INSERT INTO app.meas SELECT CASE WHEN g % 997 = 0 THEN NULL ELSE g / 3 END, g * 0.5 FROM generate_series(1, 25000) g;
 SQL
 
 cat >"$WORK/pgmig.conf" <<CONF
@@ -64,6 +74,7 @@ JOBS=4
 CHUNK_ROWS=10000
 VERIFY_MODE=full
 PROGRESS_SEC=60
+SPLIT_COLS='app.logs:created,app.meas:grp'
 CONF
 export PGMIG_CONF="$WORK/pgmig.conf"
 M="$BASE/pgmig.sh"
@@ -72,7 +83,7 @@ cd "$WORK"
 echo "== install / analyze =="
 "$M" install
 "$M" analyze
-check "이관 대상 테이블 수" "$(tq "SELECT count(*) FROM pgmig.tables WHERE migrate")" 10
+check "이관 대상 테이블 수" "$(tq "SELECT count(*) FROM pgmig.tables WHERE migrate")" 12
 check "미지원 타입(배열) 테이블 제외" "$(tq "SELECT migrate FROM pgmig.tables WHERE src_table = 'arr'")" f
 check "PK 없는 테이블 경고" "$(tq "SELECT count(*) FROM pgmig.issues WHERE level = 'WARN' AND object = 'app.nopk'")" 1
 
@@ -95,17 +106,53 @@ check "orders 청크 수" "$(tq "SELECT count(*) FROM pgmig.tasks k JOIN pgmig.t
 check "skew 청크 수 (분위수 분할)" "$(tq "SELECT count(*) FROM pgmig.tasks k JOIN pgmig.tables t ON t.id = k.table_id WHERE t.src_table = 'skew'")" 3
 check "events 청크 수 (복합 PK 선두 컬럼 분할)" "$(tq "SELECT count(*) FROM pgmig.tasks k JOIN pgmig.tables t ON t.id = k.table_id WHERE t.src_table = 'events'")" 3
 check "문자 PK 대형 테이블 1청크 경고" "$(tq "SELECT count(*) FROM pgmig.issues WHERE level = 'WARN' AND object = 'app.textpk' AND msg LIKE '%1청크%'")" 1
+tcnt() { tq "SELECT count(*) FROM pgmig.tasks k JOIN pgmig.tables t ON t.id = k.table_id WHERE t.src_table = '$1' ${2:+AND $2}"; }
+check "SPLIT_COLS 시각 컬럼 분할 (logs)" "$(tcnt logs "k.split_kind = 'time' AND k.pk_col = 'created'")" 3
+check "SPLIT_COLS 숫자 컬럼 분할 (PK 없는 meas)" "$(tcnt meas "k.split_kind = 'num' AND k.pk_col = 'grp'")" 3
+check "SPLIT_COLS 테이블은 1청크 경고 없음" "$(tq "SELECT count(*) FROM pgmig.issues WHERE level = 'WARN' AND object IN ('app.logs', 'app.meas') AND msg LIKE '%1청크%'")" 0
+check "첫 청크가 NULL 값 포함" "$(tq "SELECT pgmig.cond(pk_col, lo, hi, split_kind) LIKE '%created IS NULL%' FROM pgmig.tasks k JOIN pgmig.tables t ON t.id = k.table_id WHERE t.src_table = 'logs' AND k.lo IS NULL")" t
+
+echo "== 마감 시각 (graceful stop) =="
+# orders 청크마다 0.7초 걸리게 (target 문장 트리거) -> 시간 안에 일부만 끝나는 상황 재현. JOBS=1 로 결정적으로
+tq "CREATE FUNCTION public.pgmig_slow() RETURNS trigger LANGUAGE plpgsql AS \$\$ BEGIN PERFORM pg_sleep(0.7); RETURN NULL; END \$\$;
+    CREATE TRIGGER pgmig_slow AFTER INSERT ON app_new.orders FOR EACH STATEMENT EXECUTE FUNCTION public.pgmig_slow()" >/dev/null
+{ cat "$WORK/pgmig.conf"; echo "JOBS=1"; } >"$WORK/pgmig1.conf"
+{ cat "$WORK/pgmig1.conf"; echo "MAX_MINUTES=5"; echo "STOP_BEFORE_MIN=10"; } >"$WORK/pgmig2.conf"
+rc=0; PGMIG_CONF="$WORK/pgmig2.conf" "$M" data >"$WORK/dl0.log" 2>&1 || rc=$?
+check "conf MAX_MINUTES < STOP_BEFORE_MIN: 시작 안 함 (종료코드 3)" "$rc" 3
+check "  적재된 청크 없음" "$(tq "SELECT count(*) FROM pgmig.tasks WHERE status <> 'pending'")" 0
+DL=$(date -d '+4 seconds' '+%F %T'); DL_EPOCH=$(date -d "$DL" +%s)
+rc=0; PGMIG_CONF="$WORK/pgmig1.conf" "$M" data --until "$DL" --stop-before 0 >"$WORK/dl1.log" 2>&1 || rc=$?
+END_EPOCH=$(date +%s.%N)
+check "--until 마감: 종료코드 3" "$rc" 3
+grep -q "마감으로 멈춤" "$WORK/dl1.log" && ok "마감 메시지" || { bad "마감 메시지 없음"; cat "$WORK/dl1.log"; }
+OD=$(tcnt orders "k.status = 'done'"); OP=$(tcnt orders "k.status = 'pending'")
+[ "$OD" -ge 2 ] && [ "$OP" -ge 1 ] && ok "orders 일부만 적재 (done $OD / pending $OP)" || bad "orders 부분 적재 아님: done $OD pending $OP"
+check "  running/failed 로 남은 청크 없음 (진행 중 청크는 커밋)" "$(tq "SELECT count(*) FROM pgmig.tasks WHERE status IN ('running', 'failed')")" 0
+check "  적재 건수 = 완료 청크 rows 합 (반쪽 적재 없음)" "$(tq "SELECT count(*) FROM app_new.orders")" \
+      "$(tq "SELECT sum(rows) FROM pgmig.tasks k JOIN pgmig.tables t ON t.id = k.table_id WHERE t.src_table = 'orders' AND k.status = 'done'")"
+# 명령 종료는 진행 표시 폴링(1초) + 결과 출력만큼 늦을 수 있음. 청크 자체가 마감 전에 끝났는지는 아래 항목에서 봄
+awk -v e="$END_EPOCH" -v d="$DL_EPOCH" 'BEGIN { exit !(e <= d + 3.0) }' && ok "마감 직후 명령 종료 (+3초 이내)" || bad "마감 초과 종료: end=$END_EPOCH deadline=$DL_EPOCH"
+check "  평균 소요시간 안에 못 끝날 orders 청크는 시작 안 함 (마감 후 끝난 청크 없음)" \
+      "$(tq "SELECT count(*) FROM pgmig.tasks WHERE status = 'done' AND finished > to_timestamp($DL_EPOCH)")" 0
+OID=$(tq "SELECT id FROM pgmig.tables WHERE src_table = 'orders'")
+[ "$(tq "SELECT count(*) FROM pgmig.tasks WHERE status = 'done' AND table_id > $OID")" -gt 0 ] \
+  && ok "남은 시간에 짧은 다른 테이블 청크는 계속 진행" || bad "다른 테이블 청크가 진행되지 않음"
+tq "DROP TRIGGER pgmig_slow ON app_new.orders; DROP FUNCTION public.pgmig_slow()" >/dev/null
 "$M" data
+check "다음 실행에서 남은 청크 이어서 완료" "$(tq "SELECT count(*) FROM pgmig.tasks WHERE status <> 'done'")" 0
 check "orders 적재 건수" "$(tq "SELECT count(*) FROM app_new.orders")" 100000
 SKEW_MAX=$(tq "SELECT max(n) FROM (SELECT (SELECT count(*) FROM app_new.skew s WHERE (k.lo IS NULL OR s.id >= k.lo) AND (k.hi IS NULL OR s.id < k.hi)) n
                 FROM pgmig.tasks k JOIN pgmig.tables t ON t.id = k.table_id WHERE t.src_table = 'skew') x")
 [ "$SKEW_MAX" -le 11000 ] && ok "skew 청크 최대 ${SKEW_MAX}행 (균등 분할이면 29000)" || bad "skew 청크 불균형: 최대 ${SKEW_MAX}행"
 check "events 적재 건수" "$(tq "SELECT count(*) FROM app_new.events")" 25000
+check "logs 적재 건수 (NULL 시각 포함)" "$(tq "SELECT count(*) FROM app_new.logs")" 25000
+check "meas 적재 건수 (PK 없음, NULL 포함)" "$(tq "SELECT count(*) FROM app_new.meas")" 25000
 check "대소문자 혼용 이름 유지" "$(tq "SELECT count(*) FROM app_new.\"MixedCase\" WHERE \"Val\" IS NOT NULL")" 300
 
 echo "== index / verify / fk =="
 "$M" index
-check "PK 생성" "$(tq "SELECT count(*) FROM pg_constraint WHERE contype = 'p' AND connamespace = 'app_new'::regnamespace")" 9
+check "PK 생성" "$(tq "SELECT count(*) FROM pg_constraint WHERE contype = 'p' AND connamespace = 'app_new'::regnamespace")" 10
 check "인덱스(DESC) 생성" "$(tq "SELECT count(*) FROM pg_indexes WHERE indexname = 'orders_cust_created_ix' AND indexdef LIKE '%created DESC%'")" 1
 check "시퀀스 다음 값" "$(tq "SELECT nextval('app_new.order_seq')")" 300001
 check "실패 DDL 은 기록만 하고 진행" "$(tq "SELECT count(*) FROM pgmig.ddl WHERE status = 'failed' AND object LIKE '%orders_bad_ck'")" 1
@@ -158,6 +205,44 @@ check "재시도 후 codes 건수" "$(tq "SELECT count(*) FROM app_new.codes")" 
 "$M" cleanup >/dev/null 2>&1 && bad "미검증 청크가 있는데 cleanup 이 됨" || ok "미검증 상태에서 cleanup 거부"
 "$M" verify full
 
+echo "== 이관 기간 중 소스 변경 (sync: 범위 밖 신규 행 + verify/redo) =="
+sq() { "${P[@]}" -d pgmig_st_src -At -c "$1"; }
+sq "UPDATE app.orders SET memo = '소스 변경' WHERE id = 150003;              -- 기존 범위 안 값 변경
+    DELETE FROM app.orders WHERE id = 60000;                                -- 기존 범위 안 삭제
+    INSERT INTO app.orders (id, cust, amount, memo, created, note, ratio)   -- PK 최대값 밖 신규 15000행 (> CHUNK_ROWS)
+      SELECT 300000 + g * 3, 1 + g % 500, g, 'new', now(), 'n', 1 FROM generate_series(1, 15000) g;
+    INSERT INTO app.logs SELECT 'N' || lpad(g::text, 8, '0'), timestamp '2030-01-01' + g * interval '1.5 second', 'new'
+      FROM generate_series(1, 500) g;                                       -- 시각 범위 밖 신규
+    INSERT INTO app.logs VALUES ('NNULL', NULL, 'null 시각');               -- NULL -> 첫 청크
+    INSERT INTO app.meas SELECT 100000 + g, g FROM generate_series(1, 300) g;
+    UPDATE app.meas SET v = v + 1 WHERE grp = 5                             -- PK 없는 테이블 값 변경" >/dev/null
+TAIL=$(tq "SELECT k.id FROM pgmig.tasks k JOIN pgmig.tables t ON t.id = k.table_id WHERE t.src_table = 'orders' AND k.hi IS NULL")
+TAIL_FIN=$(tq "SELECT finished FROM pgmig.tasks WHERE id = $TAIL")
+NTASK=$(tq "SELECT count(*) FROM pgmig.tasks")
+rc=0; "$M" sync --max-minutes 0 >"$WORK/sync0.log" 2>&1 || rc=$?
+check "sync 마감 지남: 종료코드 3, 아무것도 안 함" "$rc/$(tq "SELECT count(*) FROM pgmig.tasks")" "3/$NTASK"
+"$M" status >/dev/null
+rc=0; "$M" sync >"$WORK/sync.log" 2>&1 || rc=$?
+check "sync 종료코드" "$rc" 0
+[ $rc -eq 0 ] || cat "$WORK/sync.log"
+check "sync 후 전 청크 검증 OK" "$(tq "SELECT count(*) FROM pgmig.tasks WHERE status <> 'done' OR v_status IS DISTINCT FROM 'ok'")" 0
+check "orders 마지막 청크를 적재된 최대값 다음에서 닫음" "$(tq "SELECT hi FROM pgmig.tasks WHERE id = $TAIL")" 300001
+check "  닫은 청크는 재적재하지 않음" "$(tq "SELECT finished FROM pgmig.tasks WHERE id = $TAIL")" "$TAIL_FIN"
+check "  신규 15000행 -> CHUNK_ROWS 단위 새 청크 2개" "$(tcnt orders "k.lo >= 300001")" 2
+check "orders 건수 = 소스" "$(tq "SELECT count(*) FROM app_new.orders")" "$(sq "SELECT count(*) FROM app.orders")"
+check "  기존 범위 안 변경 반영 (verify -> redo)" "$(tq "SELECT memo FROM app_new.orders WHERE id = 150003")/$(tq "SELECT count(*) FROM app_new.orders WHERE id = 60000")" "소스 변경/0"
+check "logs 시각 범위 밖 신규 -> 새 청크 1개 (time)" "$(tcnt logs)" 4
+check "  닫은 경계 = 적재된 최대 시각 + 1µs" "$(tq "SELECT lo = extract(epoch FROM timestamp '2024-01-01' + 24999 * interval '1 minute' + interval '2 ms') + 0.000001
+                                              FROM pgmig.tasks k JOIN pgmig.tables t ON t.id = k.table_id WHERE t.src_table = 'logs' AND k.hi IS NULL")" t
+check "logs 건수 = 소스 (NULL 시각 행 포함)" "$(tq "SELECT count(*) FROM app_new.logs")" "$(sq "SELECT count(*) FROM app.logs")"
+check "meas 건수/합계 = 소스 (PK 없음)" "$(tq "SELECT count(*) || '/' || sum(v) FROM app_new.meas")" "$(sq "SELECT count(*) || '/' || sum(v) FROM app.meas")"
+H="SELECT sum(hashtextextended(x::text, 0)) FROM"
+check "전 컬럼 해시 = 소스 (orders/logs/meas)" \
+      "$(tq "$H app_new.orders x")/$(tq "$H app_new.logs x")/$(tq "$H app_new.meas x")" \
+      "$(sq "$H app.orders x")/$(sq "$H app.logs x")/$(sq "$H app.meas x")"
+rc=0; "$M" sync >"$WORK/sync2.log" 2>&1 || rc=$?
+check "변경 없을 때 sync 재실행: 새 청크/재적재 없음" "$rc/$(grep -c '재이관 (해당' "$WORK/sync2.log" || true)" "0/0"
+
 echo "== report / cleanup =="
 "$M" report "$WORK/report.txt"
 check "리포트 생성" "$(grep -c '== 2. 테이블별 결과 ==' "$WORK/report.txt")" 1
@@ -166,7 +251,7 @@ cp "$WORK/report.txt" /tmp/pgmig_selftest_report.txt
 check "cleanup 후 pgmig 스키마" "$(tq "SELECT count(*) FROM pg_namespace WHERE nspname LIKE 'pgmig%'")" 0
 check "cleanup 후 foreign server" "$(tq "SELECT count(*) FROM pg_foreign_server")" 0
 check "cleanup 후 postgres_fdw 확장" "$(tq "SELECT count(*) FROM pg_extension WHERE extname = 'postgres_fdw'")" 0
-check "cleanup 후 데이터는 그대로" "$(tq "SELECT count(*) FROM app_new.orders")" 100000
+check "cleanup 후 데이터는 그대로" "$(tq "SELECT count(*) FROM app_new.orders")" 114999
 
 "${P[@]}" -d postgres -c "DROP DATABASE pgmig_st_src" -c "DROP DATABASE pgmig_st_tgt"
 rm -rf "$WORK"

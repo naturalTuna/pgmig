@@ -15,6 +15,7 @@ SRC_TYPE=oracle
 SRC_SCHEMAS='PGMIG_SRC,PGMIG_REF'
 SCHEMA_MAP='PGMIG_SRC:app,PGMIG_REF:ref'
 EXCLUDE_TABLES='PGMIG_SRC.TMP_%'
+SPLIT_COLS='PGMIG_SRC.NO_PK_LOG:LOG_TIME'
 CHUNK_ROWS=50000
 JOBS=2
 PROGRESS_SEC=60
@@ -54,4 +55,30 @@ SQL
 "$M" fk || true
 "$M" view || true
 "$M" report "$WORK/report.txt"
+
+# SPLIT_COLS / 이관 기간 중 변경분(sync) 이 오라클로 보내는 범위 조건 점검 (PG 쪽 pgmig.cond 와 같은 범위여야 함)
+echo "== 분할 컬럼 오라클 SQL 생성 점검 =="
+fail=0
+chk() {
+  local got
+  got=$("${P[@]}" -d $DB -At -c "$2")
+  if [ "$got" = "$3" ]; then echo "  [PASS] $1"; else echo "  [FAIL] $1"; echo "     기대: $3"; echo "     실제: $got"; fail=1; fi
+}
+TID="(SELECT id FROM pgmig.tables WHERE src_table = 'ORDERS')"
+LID="(SELECT id FROM pgmig.tables WHERE src_table = 'NO_PK_LOG')"
+chk "TIMESTAMP 컬럼: 첫 청크는 NULL 포함, 마이크로초 유지" \
+    "SELECT pgmig.ora_cond($LID, 'log_time', NULL, extract(epoch FROM timestamp '2024-01-01 06:00:00.5'), 'time')" \
+    "(\"LOG_TIME\" < TIMESTAMP '2024-01-01 06:00:00.500000' OR \"LOG_TIME\" IS NULL)"
+chk "DATE 컬럼: TO_DATE(인덱스 사용 가능), 초 단위로 올림" \
+    "SELECT pgmig.ora_cond($TID, 'order_date', 1704067200.5, 1704153600, 'time')" \
+    "\"ORDER_DATE\" >= TO_DATE('2024-01-01 00:00:01', 'YYYY-MM-DD HH24:MI:SS') AND \"ORDER_DATE\" < TO_DATE('2024-01-02 00:00:00', 'YYYY-MM-DD HH24:MI:SS')"
+chk "DATE 컬럼 epoch 식 (분위수/min/max 용)" \
+    "SELECT pgmig.ora_split_expr($TID, 'order_date', 'time')" \
+    "((CAST(\"ORDER_DATE\" AS DATE) - DATE '1970-01-01') * 86400)"
+chk "숫자 PK 는 기존과 같음" "SELECT pgmig.ora_cond($TID, 'order_id', 3, NULL, NULL)" "\"ORDER_ID\" >= 3"
+chk "PG 쪽 조건 (stage foreign table 로 push down)" \
+    "SELECT pgmig.cond('order_date', 1704067200.5, NULL, 'time')" "order_date >= '2024-01-01 00:00:00.500000+00'"
+chk "SPLIT_COLS 지정 테이블 (NO_PK_LOG:LOG_TIME, 소형 -> 1청크라 분할 안 함)" \
+    "SELECT count(*) FROM pgmig.issues WHERE object = 'PGMIG_SRC.NO_PK_LOG' AND msg LIKE '분할 컬럼 log_time (time)%'" 1
 echo "WORK=$WORK"
+[ $fail -eq 0 ]

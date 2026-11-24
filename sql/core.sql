@@ -6,8 +6,10 @@
 --   PROCEDURE pgmig.src_<type>_catalog()                  -> tables/columns/constraints/indexes/sequences/
 --                                                            partitions/comments/views/issues 채움
 --   FUNCTION  pgmig.src_<type>_stage_sql(table_id) text   -> CREATE FOREIGN TABLE pgmig_stage.t<id> 문
---   FUNCTION  pgmig.src_<type>_stats(table_id, pk)        -> (lo, hi, cnt)
---   FUNCTION  pgmig.src_<type>_count(table_id, pk, lo, hi)-> bigint
+--   FUNCTION  pgmig.src_<type>_stats(table_id, col, from, kind)   -> (lo, hi, cnt)   from: col >= from 만 (NULL=전체)
+--   FUNCTION  pgmig.src_<type>_count(table_id, col, lo, hi, kind) -> bigint
+--   (선택) FUNCTION pgmig.src_<type>_bounds(table_id, col, n, kind) -> numeric[]   분위수 경계
+--   kind: NULL(숫자 PK) / num / time(값은 epoch 초) -> pgmig.cond(col, lo, hi, kind) 와 같은 범위여야 함
 -- =====================================================================
 CREATE SCHEMA pgmig;
 CREATE SCHEMA pgmig_stage;
@@ -170,9 +172,11 @@ CREATE TABLE pgmig.ddl (
 CREATE TABLE pgmig.tasks (
   id        serial PRIMARY KEY,
   table_id  int NOT NULL,
-  pk_col    text,              -- NULL 이면 테이블 통째로 1청크
-  lo        numeric,           -- pk >= lo  (NULL = 하한 없음)
-  hi        numeric,           -- pk <  hi  (NULL = 상한 없음)
+  pk_col    text,              -- 분할 컬럼 (숫자 PK 또는 SPLIT_COLS 로 지정한 컬럼). NULL 이면 테이블 통째로 1청크
+  split_kind text,             -- NULL = 숫자 PK / num = 지정한 숫자 컬럼 / time = 지정한 날짜·시각 컬럼(lo/hi 는 epoch 초)
+                               --   num/time 은 NOT NULL 보장이 없으므로 첫 청크(하한 없음)가 NULL 값 행도 가져감
+  lo        numeric,           -- col >= lo  (NULL = 하한 없음)
+  hi        numeric,           -- col <  hi  (NULL = 상한 없음)
   status    text NOT NULL DEFAULT 'pending', -- pending/running/done/failed
   redo      boolean NOT NULL DEFAULT false,  -- true 면 적재 전 해당 범위 삭제 (repair)
   rows      bigint,
@@ -186,9 +190,11 @@ CREATE TABLE pgmig.tasks (
   src_hash  numeric,
   tgt_hash  numeric,
   v_error   text,
-  v_at      timestamptz
+  v_at      timestamptz,
+  pid       int                -- 이 청크를 잡은 워커 세션 pid (살아 있는 세션의 running 은 다른 실행이 건드리지 않음)
 );
 CREATE INDEX ON pgmig.tasks (status);
+CREATE INDEX ON pgmig.tasks (table_id);
 CREATE INDEX ON pgmig.tasks (v_status);
 
 CREATE FUNCTION pgmig.rel(p_table int) RETURNS text
@@ -199,12 +205,42 @@ CREATE FUNCTION pgmig.cols(p_table int) RETURNS text
 LANGUAGE sql STABLE AS
 $$ SELECT string_agg(quote_ident(tgt_col), ', ' ORDER BY pos) FROM pgmig.columns WHERE table_id = p_table $$;
 
+-- epoch 초(numeric) -> UTC 기준 timestamp (마이크로초까지 정확하게. float 변환 오차 없이)
+CREATE FUNCTION pgmig.epoch_ts(e numeric) RETURNS timestamp
+LANGUAGE sql IMMUTABLE STRICT AS
+$$ SELECT (timestamptz '1970-01-01 00:00:00+00' + floor(e)::bigint * interval '1 second'
+           + round((e - floor(e)) * 1000000)::bigint * interval '1 microsecond') AT TIME ZONE 'UTC' $$;
+
+-- 청크 경계값 리터럴. time 은 '...+00' 형태 -> timestamp 컬럼은 오프셋 무시(UTC 벽시계), timestamptz 는 UTC 로 해석
+--   (time 분할의 경계값은 extract(epoch) 로 구하므로 양쪽 다 같은 시각을 가리킴)
+CREATE FUNCTION pgmig.bound_lit(p_v numeric, p_kind text) RETURNS text
+LANGUAGE sql IMMUTABLE AS
+$$ SELECT CASE WHEN p_kind = 'time'
+               THEN quote_literal(to_char(pgmig.epoch_ts(p_v), 'YYYY-MM-DD HH24:MI:SS.US') || '+00')
+               ELSE quote_literal(p_v::text) END $$;
+
+-- 분할 컬럼 값을 numeric 으로 (time 은 epoch 초)
+CREATE FUNCTION pgmig.split_expr(p_col text, p_kind text) RETURNS text
+LANGUAGE sql IMMUTABLE AS
+$$ SELECT CASE WHEN p_kind = 'time' THEN format('extract(epoch FROM %I)::numeric', p_col)
+               ELSE format('%I::numeric', p_col) END $$;
+
+-- 분할 컬럼 값 사이의 최소 간격 (정수형/초 단위 날짜면 1, 그 외 1 마이크로초 단위로 취급)
+CREATE FUNCTION pgmig.split_step(p_type text) RETURNS numeric
+LANGUAGE sql IMMUTABLE AS
+$$ SELECT CASE WHEN p_type ~ '^(smallint|integer|bigint|date|timestamp\(0\)( with(out)? time zone)?|timestamptz\(0\))$'
+                 OR p_type ~ '^numeric\(\d+(,\s*0)?\)$' THEN 1 ELSE 0.000001 END $$;
+
 -- 청크 조건. 값은 따옴표 리터럴로 -> 컬럼 타입으로 해석되어 FDW 가 WHERE 를 소스로 push down 할 수 있음
-CREATE FUNCTION pgmig.cond(p_pk text, p_lo numeric, p_hi numeric) RETURNS text
+--   p_kind 가 num/time(SPLIT_COLS 로 지정한 컬럼)이면 첫 청크(하한 없음)가 NULL 값도 가져감 -> 누락 없음
+CREATE FUNCTION pgmig.cond(p_pk text, p_lo numeric, p_hi numeric, p_kind text DEFAULT NULL) RETURNS text
 LANGUAGE sql IMMUTABLE AS
 $$ SELECT coalesce(nullif(concat_ws(' AND ',
-       CASE WHEN p_pk IS NOT NULL AND p_lo IS NOT NULL THEN format('%I >= %L', p_pk, p_lo) END,
-       CASE WHEN p_pk IS NOT NULL AND p_hi IS NOT NULL THEN format('%I < %L', p_pk, p_hi) END), ''), 'true') $$;
+       CASE WHEN p_pk IS NOT NULL AND p_lo IS NOT NULL THEN format('%I >= %s', p_pk, pgmig.bound_lit(p_lo, p_kind)) END,
+       CASE WHEN p_pk IS NOT NULL AND p_hi IS NOT NULL THEN
+            CASE WHEN p_kind IS NOT NULL AND p_lo IS NULL
+                 THEN format('(%I < %s OR %I IS NULL)', p_pk, pgmig.bound_lit(p_hi, p_kind), p_pk)
+                 ELSE format('%I < %s', p_pk, pgmig.bound_lit(p_hi, p_kind)) END END), ''), 'true') $$;
 
 -- ---------------------------------------------------------------------
 -- analyze : 소스 카탈로그 수집 + 공통 점검
@@ -299,7 +335,7 @@ BEGIN
   -- PK 없는 테이블
   INSERT INTO pgmig.issues (level, object, msg)
   SELECT 'WARN', t.src_schema || '.' || t.src_table,
-         'PK 없음: 청크 분할/행 단위 diff 불가 (테이블 통째로 이관·검증)'
+         'PK 없음: 행 단위 diff 불가, 청크 분할도 안 됨 (테이블 통째로 이관·검증). 큰 테이블이면 SPLIT_COLS 로 날짜/숫자 분할 컬럼 지정'
     FROM pgmig.tables t
    WHERE t.migrate AND NOT EXISTS (SELECT FROM pgmig.constraints c WHERE c.table_id = t.id AND c.ctype = 'p');
 END $$;
@@ -633,18 +669,44 @@ BEGIN
   END LOOP;
 END $$;
 
+-- SPLIT_COLS 에서 이 테이블의 분할 컬럼 찾기 ('SCHEMA.TABLE:COL,...'  테이블은 대소문자 무시, 컬럼은 소스/타깃 이름)
+--   반환: col(타깃 컬럼명), kind(num/time, 지원 안 하는 타입이면 NULL), spec(설정 원문, 지정 없으면 NULL)
+CREATE FUNCTION pgmig.split_col(p_table int, OUT col text, OUT kind text, OUT ctype text, OUT spec text)
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+  t pgmig.tables;
+  e text;
+BEGIN
+  SELECT * INTO t FROM pgmig.tables WHERE id = p_table;
+  SELECT btrim(x) INTO spec
+    FROM unnest(string_to_array(pgmig.cfg('split_cols', ''), ',')) x
+   WHERE upper(btrim(split_part(btrim(x), ':', 1))) = upper(t.src_schema || '.' || t.src_table) LIMIT 1;
+  IF spec IS NULL THEN RETURN; END IF;
+  e := btrim(split_part(spec, ':', 2));
+  SELECT c.tgt_col, c.tgt_type,
+         CASE WHEN c.tgt_type ~ '^(smallint|integer|bigint|numeric|real|double)' THEN 'num'
+              WHEN c.tgt_type ~ '^(date|timestamp)' THEN 'time' END
+    INTO col, ctype, kind
+    FROM pgmig.columns c
+   WHERE c.table_id = p_table AND (c.src_col = e OR c.tgt_col = e)
+   ORDER BY (c.src_col = e) DESC LIMIT 1;
+END $$;
+
 -- 청크 계획
---   숫자 PK(또는 복합 PK 의 숫자 선두 컬럼)로 범위 분할. 첫 청크 하한 / 마지막 청크 상한 없음.
---   경계값: CHUNK_SPLIT=quantile(기본) 이면 소스에서 PK 분위수(NTILE)로 → ID 가 치우쳐도 청크 크기가 고름
+--   분할 컬럼: SPLIT_COLS 로 지정한 숫자/날짜 컬럼 > 숫자 PK(또는 복합 PK 의 숫자 선두 컬럼). 첫 청크 하한 / 마지막 청크 상한 없음.
+--   경계값: CHUNK_SPLIT=quantile(기본) 이면 소스에서 분위수(NTILE)로 → 값이 치우쳐도 청크 크기가 고름
 --           uniform 이거나 플러그인이 지원 안 하면 (max-min)/n 균등 분할 (예전 방식)
---   숫자 PK 가 없는 큰 테이블은 1청크 → WARN 으로 알림 (병렬 / 부분 재시도 불가)
+--   분할 컬럼이 없는 큰 테이블은 1청크 → WARN 으로 알림 (병렬 / 부분 재시도 불가)
 CREATE PROCEDURE pgmig.plan_tasks() LANGUAGE plpgsql AS $$
 DECLARE
   r        record;
+  sc       record;
   v_type   text   := pgmig.cfg('src_type');
   v_chunk  bigint := pgmig.cfg('chunk_rows', '500000')::bigint;
   v_force  boolean := pgmig.cfg('chunk_always_count', 'off') = 'on';
   v_split  text   := lower(pgmig.cfg('chunk_split', 'quantile'));
+  v_col    text;
+  v_kind   text;
   v_lo     numeric;
   v_hi     numeric;
   v_cnt    bigint;
@@ -669,17 +731,36 @@ BEGIN
   LOOP
     n := 1;
     v_bounds := NULL;
-    IF r.pk IS NOT NULL AND (v_force OR r.est_rows IS NULL OR r.est_rows > v_chunk) THEN
-      EXECUTE format('SELECT lo, hi, cnt FROM pgmig.%I($1, $2)', 'src_' || v_type || '_stats')
-        USING r.id, r.pk INTO v_lo, v_hi, v_cnt;
+    v_col  := r.pk;
+    v_kind := NULL;
+
+    sc := pgmig.split_col(r.id);
+    IF sc.spec IS NOT NULL THEN
+      IF sc.col IS NULL THEN
+        INSERT INTO pgmig.issues (level, object, msg)
+        VALUES ('WARN', r.src_schema || '.' || r.src_table,
+                'SPLIT_COLS 의 컬럼을 찾지 못함 (' || sc.spec || ') -> 무시하고 기본 규칙으로 분할');
+      ELSIF sc.kind IS NULL THEN
+        INSERT INTO pgmig.issues (level, object, msg)
+        VALUES ('WARN', r.src_schema || '.' || r.src_table,
+                format('SPLIT_COLS 의 %s 컬럼 타입(%s)은 분할 불가 (숫자/날짜/시각만) -> 무시하고 기본 규칙으로 분할', sc.col, sc.ctype));
+      ELSE
+        v_col := sc.col; v_kind := sc.kind;
+      END IF;
+    END IF;
+
+    IF v_col IS NOT NULL AND (v_force OR r.est_rows IS NULL OR r.est_rows > v_chunk) THEN
+      EXECUTE format('SELECT lo, hi, cnt FROM pgmig.%I($1, $2, NULL, $3)', 'src_' || v_type || '_stats')
+        USING r.id, v_col, v_kind INTO v_lo, v_hi, v_cnt;
       UPDATE pgmig.tables SET est_rows = v_cnt WHERE id = r.id;
+      r.est_rows := v_cnt;
       IF v_cnt > v_chunk AND v_hi > v_lo THEN
         n    := ceil(v_cnt::numeric / v_chunk);
         step := ceil((v_hi - v_lo + 1) / n);
         IF v_split = 'quantile' THEN
           BEGIN
-            EXECUTE format('SELECT pgmig.%I($1, $2, $3)', 'src_' || v_type || '_bounds')
-              USING r.id, r.pk, n INTO v_bounds;
+            EXECUTE format('SELECT pgmig.%I($1, $2, $3, $4)', 'src_' || v_type || '_bounds')
+              USING r.id, v_col, n, v_kind INTO v_bounds;
           EXCEPTION WHEN undefined_function THEN
             v_bounds := NULL;           -- 플러그인 미지원 → 균등 분할
           WHEN OTHERS THEN
@@ -696,15 +777,15 @@ BEGIN
       -- 경계 b1 < b2 < ... : (-inf,b1) [b1,b2) ... [bk,+inf)
       n := cardinality(v_bounds) + 1;
       FOR i IN 1 .. n LOOP
-        INSERT INTO pgmig.tasks (table_id, pk_col, lo, hi)
-        VALUES (r.id, r.pk,
+        INSERT INTO pgmig.tasks (table_id, pk_col, split_kind, lo, hi)
+        VALUES (r.id, v_col, v_kind,
                 CASE WHEN i > 1 THEN v_bounds[i - 1] END,
                 CASE WHEN i < n THEN v_bounds[i] END);
       END LOOP;
     ELSIF n = 1 THEN
       INSERT INTO pgmig.tasks (table_id) VALUES (r.id);
-      IF r.pk IS NULL AND r.est_rows IS NULL THEN
-        -- 숫자 PK 가 없고 통계 추정치도 없으면 크기를 한 번 센다 (1청크 대형 테이블 경고용)
+      IF v_col IS NULL AND r.est_rows IS NULL THEN
+        -- 분할 컬럼이 없고 통계 추정치도 없으면 크기를 한 번 센다 (1청크 대형 테이블 경고용)
         BEGIN
           EXECUTE format('SELECT pgmig.%I($1, NULL, NULL, NULL)', 'src_' || v_type || '_count')
             USING r.id INTO r.est_rows;
@@ -712,30 +793,102 @@ BEGIN
         EXCEPTION WHEN OTHERS THEN NULL;
         END;
       END IF;
-      IF r.pk IS NULL AND coalesce(r.est_rows, 0) > v_chunk * 2 THEN
+      IF v_col IS NULL AND coalesce(r.est_rows, 0) > v_chunk * 2 THEN
         INSERT INTO pgmig.issues (level, object, msg)
         VALUES ('WARN', r.src_schema || '.' || r.src_table,
-                format('숫자 PK 가 없어 약 %s행을 1청크(한 트랜잭션)로 이관 — 병렬화 / 부분 재시도 불가. '
-                       '시간·WAL·undo 여유를 확인하고, 가능하면 숫자 PK(또는 숫자 선두 컬럼의 PK) 기준으로 나눌 것',
-                       r.est_rows));
+                format('숫자 PK 가 없어 약 %s행을 1청크(한 트랜잭션)로 이관 — 병렬화 / 부분 재시도 / 시간 나눠 이관 불가. '
+                       '시간·WAL·undo 여유를 확인하고, 가능하면 SPLIT_COLS=%s:<날짜/숫자 컬럼> 으로 분할 컬럼을 지정할 것',
+                       r.est_rows, r.src_schema || '.' || r.src_table));
       END IF;
     ELSE
       -- 첫 청크는 하한 없음, 마지막 청크는 상한 없음 -> min/max 조사 이후 들어온 값도 누락 없음
       FOR i IN 0 .. n - 1 LOOP
-        INSERT INTO pgmig.tasks (table_id, pk_col, lo, hi)
-        VALUES (r.id, r.pk,
+        INSERT INTO pgmig.tasks (table_id, pk_col, split_kind, lo, hi)
+        VALUES (r.id, v_col, v_kind,
                 CASE WHEN i > 0     THEN v_lo + i * step END,
                 CASE WHEN i < n - 1 THEN v_lo + (i + 1) * step END);
       END LOOP;
     END IF;
+
+    IF v_kind IS NOT NULL THEN
+      INSERT INTO pgmig.issues (level, object, msg)
+      SELECT 'INFO', r.src_schema || '.' || r.src_table,
+             format('분할 컬럼 %s (%s) 로 %s청크 (NULL 값 행은 첫 청크에 포함)', v_col, v_kind, count(*))
+        FROM pgmig.tasks WHERE table_id = r.id;
+    END IF;
+  END LOOP;
+END $$;
+
+-- ---------------------------------------------------------------------
+-- 이관 기간 중 소스에 새로 들어온 행 (분할 컬럼 범위 밖) 따라잡기
+--   마지막 청크(상한 없음)가 이미 적재됐으면: 그 청크 상한을 "target 에 적재된 최대값 다음"으로 닫고,
+--   그 뒤 범위를 새 청크(필요하면 CHUNK_ROWS 단위로 여러 개)로 추가 -> data 가 신규 행만 가져감.
+--   (안 그러면 신규 행 때문에 마지막 청크 전체가 verify 불일치 -> 통째 재이관)
+--   기존 범위 안의 변경(UPDATE/DELETE, 늦게 들어온 작은 ID)은 verify(full) + repair 가 처리
+-- ---------------------------------------------------------------------
+CREATE FUNCTION pgmig.catchup()
+RETURNS TABLE (tbl text, closed_task int, new_range text, src_rows bigint, new_chunks int)
+LANGUAGE plpgsql AS $$
+DECLARE
+  r       record;
+  v_type  text   := pgmig.cfg('src_type');
+  v_chunk bigint := pgmig.cfg('chunk_rows', '500000')::bigint;
+  m       numeric;
+  b       numeric;
+  s_lo    numeric;
+  s_hi    numeric;
+  s_cnt   bigint;
+  n       int;
+  step    numeric;
+  i       int;
+BEGIN
+  FOR r IN
+    SELECT k.*, c.tgt_type
+      FROM pgmig.tasks k
+      JOIN pgmig.columns c ON c.table_id = k.table_id AND c.tgt_col = k.pk_col
+     WHERE k.pk_col IS NOT NULL AND k.hi IS NULL AND k.status = 'done'
+     ORDER BY k.id
+  LOOP
+    EXECUTE format('SELECT max(%s) FROM %s WHERE %s', pgmig.split_expr(r.pk_col, r.split_kind),
+                   pgmig.rel(r.table_id), pgmig.cond(r.pk_col, r.lo, r.hi, r.split_kind)) INTO m;
+    CONTINUE WHEN m IS NULL;          -- 아직 빈 마지막 청크: 신규 행은 verify/repair 로 들어옴
+    b := CASE WHEN pgmig.split_step(r.tgt_type) = 1 THEN floor(m) + 1 ELSE m + 0.000001 END;
+    EXECUTE format('SELECT lo, hi, cnt FROM pgmig.%I($1, $2, $3, $4)', 'src_' || v_type || '_stats')
+      USING r.table_id, r.pk_col, b, r.split_kind INTO s_lo, s_hi, s_cnt;
+
+    -- 범위가 줄었으니 검증 결과는 무효 (target 행은 전부 b 미만이라 재적재는 불필요)
+    UPDATE pgmig.tasks SET hi = b, v_status = NULL, v_mode = NULL, src_cnt = NULL, tgt_cnt = NULL,
+                           src_hash = NULL, tgt_hash = NULL, v_error = NULL
+     WHERE id = r.id;
+
+    n := greatest(1, ceil(coalesce(s_cnt, 0)::numeric / v_chunk))::int;
+    IF n > 1 AND s_hi > b THEN
+      step := ceil((s_hi - b + 1) / n);
+    ELSE
+      n := 1;
+    END IF;
+    FOR i IN 0 .. n - 1 LOOP
+      INSERT INTO pgmig.tasks (table_id, pk_col, split_kind, lo, hi)
+      VALUES (r.table_id, r.pk_col, r.split_kind, b + i * coalesce(step, 0),
+              CASE WHEN i < n - 1 THEN b + (i + 1) * step END);
+    END LOOP;
+
+    tbl := pgmig.rel(r.table_id); closed_task := r.id;
+    new_range := pgmig.cond(r.pk_col, b, NULL, r.split_kind);
+    src_rows := coalesce(s_cnt, 0); new_chunks := n;
+    RETURN NEXT;
   END LOOP;
 END $$;
 
 -- ---------------------------------------------------------------------
 -- 데이터 이관 워커
 --   청크 적재(INSERT)와 상태 갱신(done)이 같은 트랜잭션 -> 세션이 죽어도 반쪽 청크가 남지 않음
+--   마감(graceful stop): p_stop 이후엔 새 청크를 잡지 않음 (진행 중인 청크는 끝까지 -> 커밋)
+--     p_deadline 이 있으면 "그 테이블의 완료 청크 평균 소요시간" 안에 못 끝날 청크도 시작 안 함
+--     (긴 청크는 건너뛰고 남은 시간에 끝낼 수 있는 다른 테이블 청크는 계속 진행)
 -- ---------------------------------------------------------------------
-CREATE PROCEDURE pgmig.worker() LANGUAGE plpgsql AS $$
+CREATE PROCEDURE pgmig.worker(p_stop timestamptz DEFAULT NULL, p_deadline timestamptz DEFAULT NULL)
+LANGUAGE plpgsql AS $$
 DECLARE
   t      pgmig.tasks;
   v_rel  text;
@@ -745,16 +898,23 @@ DECLARE
   v_err  text;
 BEGIN
   LOOP
-    UPDATE pgmig.tasks SET status = 'running', started = clock_timestamp(), finished = NULL, error = NULL
-     WHERE id = (SELECT id FROM pgmig.tasks WHERE status = 'pending'
-                  ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1)
+    UPDATE pgmig.tasks SET status = 'running', started = clock_timestamp(), finished = NULL, error = NULL,
+                           pid = pg_backend_pid()
+     WHERE id = (SELECT k.id FROM pgmig.tasks k
+                  WHERE k.status = 'pending'
+                    AND (p_stop IS NULL OR clock_timestamp() < p_stop)
+                    AND (p_deadline IS NULL
+                         OR clock_timestamp() + coalesce((SELECT avg(d.finished - d.started) FROM pgmig.tasks d
+                                                           WHERE d.table_id = k.table_id AND d.status = 'done'
+                                                             AND d.finished IS NOT NULL), interval '0') < p_deadline)
+                  ORDER BY k.id FOR UPDATE SKIP LOCKED LIMIT 1)
     RETURNING * INTO t;
     EXIT WHEN NOT FOUND;
     COMMIT;
 
     v_rel  := pgmig.rel(t.table_id);
     v_cols := pgmig.cols(t.table_id);
-    v_cond := pgmig.cond(t.pk_col, t.lo, t.hi);
+    v_cond := pgmig.cond(t.pk_col, t.lo, t.hi, t.split_kind);
     v_err  := NULL;
     v_rows := NULL;
     BEGIN
@@ -777,6 +937,7 @@ BEGIN
            rows     = v_rows,
            finished = clock_timestamp(),
            error    = v_err,
+           pid      = NULL,
            v_status = NULL, v_mode = NULL, src_cnt = NULL, tgt_cnt = NULL,
            src_hash = NULL, tgt_hash = NULL, v_error = NULL, v_at = NULL
      WHERE id = t.id;
@@ -789,7 +950,9 @@ END $$;
 --   count : 청크별 건수 비교 (소스 쪽 count 는 소스 DB 에서 수행)
 --   full  : 청크별 건수 + 전 컬럼 행 해시 합 비교 (소스를 한 번 더 읽음)
 -- ---------------------------------------------------------------------
-CREATE PROCEDURE pgmig.verify_worker(p_mode text) LANGUAGE plpgsql AS $$
+--   p_stop 이후엔 새 청크 검증을 시작하지 않음. 검증한 지 오래된 청크(미검증 포함)부터
+--     -> 매일 시간 제한으로 돌려도 전 청크가 돌아가며 검증됨
+CREATE PROCEDURE pgmig.verify_worker(p_mode text, p_stop timestamptz DEFAULT NULL) LANGUAGE plpgsql AS $$
 DECLARE
   t      pgmig.tasks;
   v_type text := pgmig.cfg('src_type');
@@ -806,20 +969,21 @@ BEGIN
     RAISE EXCEPTION '검증 모드는 count 또는 full';
   END IF;
   LOOP
-    UPDATE pgmig.tasks SET v_status = 'running'
+    UPDATE pgmig.tasks SET v_status = 'running', pid = pg_backend_pid()
      WHERE id = (SELECT id FROM pgmig.tasks WHERE status = 'done' AND v_status = 'pending'
-                  ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1)
+                    AND (p_stop IS NULL OR clock_timestamp() < p_stop)
+                  ORDER BY v_at NULLS FIRST, id FOR UPDATE SKIP LOCKED LIMIT 1)
     RETURNING * INTO t;
     EXIT WHEN NOT FOUND;
     COMMIT;
 
     v_rel  := pgmig.rel(t.table_id);
-    v_cond := pgmig.cond(t.pk_col, t.lo, t.hi);
+    v_cond := pgmig.cond(t.pk_col, t.lo, t.hi, t.split_kind);
     v_err  := NULL; s_cnt := NULL; t_cnt := NULL; s_hash := NULL; t_hash := NULL;
     BEGIN
       IF p_mode = 'count' THEN
-        EXECUTE format('SELECT pgmig.%I($1, $2, $3, $4)', 'src_' || v_type || '_count')
-          USING t.table_id, t.pk_col, t.lo, t.hi INTO s_cnt;
+        EXECUTE format('SELECT pgmig.%I($1, $2, $3, $4, $5)', 'src_' || v_type || '_count')
+          USING t.table_id, t.pk_col, t.lo, t.hi, t.split_kind INTO s_cnt;
         EXECUTE format('SELECT count(*) FROM %s WHERE %s', v_rel, v_cond) INTO t_cnt;
       ELSE
         -- 행 전체를 text 로 만든 뒤 64bit 해시, 그 합(순서 무관)을 비교
@@ -839,7 +1003,7 @@ BEGIN
                            WHEN s_cnt = t_cnt AND s_hash IS NOT DISTINCT FROM t_hash THEN 'ok'
                            ELSE 'mismatch' END,
            v_mode = p_mode, src_cnt = s_cnt, tgt_cnt = t_cnt,
-           src_hash = s_hash, tgt_hash = t_hash, v_error = v_err, v_at = clock_timestamp()
+           src_hash = s_hash, tgt_hash = t_hash, v_error = v_err, v_at = clock_timestamp(), pid = NULL
      WHERE id = t.id;
     COMMIT;
   END LOOP;
@@ -890,7 +1054,7 @@ BEGIN
     FROM pgmig.constraints c WHERE c.table_id = t.table_id AND c.ctype = 'p' LIMIT 1;
   IF v_pk IS NULL THEN RAISE EXCEPTION 'PK 없는 테이블은 행 단위 비교 불가'; END IF;
   v_cols := pgmig.cols(t.table_id);
-  v_cond := pgmig.cond(t.pk_col, t.lo, t.hi);
+  v_cond := pgmig.cond(t.pk_col, t.lo, t.hi, t.split_kind);
   RETURN QUERY EXECUTE format($q$
     SELECT k, CASE WHEN t.h IS NULL THEN 'target 에 없음'
                    WHEN s.h IS NULL THEN 'source 에 없음'

@@ -75,32 +75,38 @@ SELECT format('CREATE FOREIGN TABLE pgmig_stage.%I (%s) SERVER pgmig_src OPTIONS
   FROM pgmig.tables t WHERE t.id = p_table
 $$;
 
-CREATE FUNCTION pgmig.src_postgres_stats(p_table int, p_pk text, OUT lo numeric, OUT hi numeric, OUT cnt bigint)
+-- 분할 컬럼 통계. p_from 이 있으면 col >= p_from 범위만 (catchup 용). time 은 epoch 초
+CREATE FUNCTION pgmig.src_postgres_stats(p_table int, p_pk text, p_from numeric DEFAULT NULL, p_kind text DEFAULT NULL,
+                                         OUT lo numeric, OUT hi numeric, OUT cnt bigint)
 LANGUAGE plpgsql AS $$
 BEGIN
-  EXECUTE format('SELECT min(%1$I), max(%1$I), count(*) FROM pgmig_stage.%2$I', p_pk, 't' || p_table)
+  EXECUTE format('SELECT min(%1$s), max(%1$s), count(*) FROM pgmig_stage.%2$I WHERE %3$s',
+                 pgmig.split_expr(p_pk, p_kind), 't' || p_table,
+                 CASE WHEN p_from IS NULL THEN 'true' ELSE pgmig.cond(p_pk, p_from, NULL, p_kind) END)
     INTO lo, hi, cnt;
 END $$;
 
-CREATE FUNCTION pgmig.src_postgres_count(p_table int, p_pk text, p_lo numeric, p_hi numeric) RETURNS bigint
-LANGUAGE plpgsql AS $$
+CREATE FUNCTION pgmig.src_postgres_count(p_table int, p_pk text, p_lo numeric, p_hi numeric, p_kind text DEFAULT NULL)
+RETURNS bigint LANGUAGE plpgsql AS $$
 DECLARE
   r bigint;
 BEGIN
-  EXECUTE format('SELECT count(*) FROM pgmig_stage.%I WHERE %s', 't' || p_table, pgmig.cond(p_pk, p_lo, p_hi)) INTO r;
+  EXECUTE format('SELECT count(*) FROM pgmig_stage.%I WHERE %s', 't' || p_table, pgmig.cond(p_pk, p_lo, p_hi, p_kind)) INTO r;
   RETURN r;
 END $$;
 
 -- 분위수 경계 (NTILE): n 개 버킷의 시작값 중 첫 번째를 뺀 n-1 개 (오름차순, 중복 제거)
---   postgres_fdw 는 윈도 함수를 push down 하지 않아 PK 컬럼만 읽어와서 계산 (selftest 규모 전제)
-CREATE FUNCTION pgmig.src_postgres_bounds(p_table int, p_pk text, p_n int) RETURNS numeric[]
+--   postgres_fdw 는 윈도 함수를 push down 하지 않아 분할 컬럼만 읽어와서 계산 (selftest 규모 전제)
+--   NULL 값은 제외 (첫 청크에 들어감)
+CREATE FUNCTION pgmig.src_postgres_bounds(p_table int, p_pk text, p_n int, p_kind text DEFAULT NULL) RETURNS numeric[]
 LANGUAGE plpgsql AS $$
 DECLARE
   r numeric[];
 BEGIN
-  EXECUTE format('SELECT array_agg(b ORDER BY b) FROM (SELECT DISTINCT min(%1$I)::numeric AS b
-                    FROM (SELECT %1$I, ntile($1) OVER (ORDER BY %1$I) AS t FROM pgmig_stage.%2$I) s
-                   GROUP BY t) x', p_pk, 't' || p_table)
+  EXECUTE format('SELECT array_agg(b ORDER BY b) FROM (SELECT DISTINCT min(v) AS b
+                    FROM (SELECT v, ntile($1) OVER (ORDER BY v) AS t
+                            FROM (SELECT %1$s AS v FROM pgmig_stage.%2$I WHERE %3$I IS NOT NULL) a) s
+                   GROUP BY t) x', pgmig.split_expr(p_pk, p_kind), 't' || p_table, p_pk)
     USING p_n INTO r;
   RETURN r[2:];
 END $$;

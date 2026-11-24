@@ -20,7 +20,8 @@ EXCLUDE_TABLES='PGMIG_SRC.TMP_%'             # TMP_BACKUP_EMP 제외 테스트
 
 # ---- 실행 ----
 JOBS=4
-CHUNK_ROWS=50000          # ORDERS(30만건)가 여러 청크로 나뉘게
+CHUNK_ROWS=50000          # ORDERS(30만건)가 여러 청크로 나뉘게 (시나리오 D 는 1000)
+#SPLIT_COLS='PGMIG_SRC.NO_PK_LOG:LOG_TIME'   # 시나리오 D: PK 없는 로그 테이블을 TIMESTAMP 컬럼으로 분할
 VERIFY_MODE=full
 PROGRESS_SEC=5
 

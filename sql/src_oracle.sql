@@ -256,43 +256,81 @@ CREATE FUNCTION pgmig.ora_src_col(p_table int, p_tgt_col text) RETURNS text
 LANGUAGE sql STABLE AS
 $$ SELECT pgmig.ora_q(src_col) FROM pgmig.columns WHERE table_id = p_table AND tgt_col = p_tgt_col $$;
 
-CREATE FUNCTION pgmig.src_oracle_stats(p_table int, p_pk text, OUT lo numeric, OUT hi numeric, OUT cnt bigint)
+-- 분할 컬럼 식 (오라클 쪽). time 은 epoch 초 (초 미만은 버림 -> 경계 계산용이라 상관없음)
+CREATE FUNCTION pgmig.ora_split_expr(p_table int, p_col text, p_kind text) RETURNS text
+LANGUAGE sql STABLE AS $$
+SELECT CASE
+  WHEN p_kind IS DISTINCT FROM 'time' THEN pgmig.ora_src_col(p_table, p_col)
+  WHEN c.tgt_type ~ '^timestamptz'
+    THEN format('((CAST(SYS_EXTRACT_UTC(%s) AS DATE) - DATE ''1970-01-01'') * 86400)', pgmig.ora_src_col(p_table, p_col))
+  ELSE format('((CAST(%s AS DATE) - DATE ''1970-01-01'') * 86400)', pgmig.ora_src_col(p_table, p_col)) END
+  FROM pgmig.columns c WHERE c.table_id = p_table AND c.tgt_col = p_col
+$$;
+
+-- 경계값 리터럴 (오라클 쪽). pgmig.cond 의 PG 쪽 조건과 같은 시각을 가리켜야 함
+--   DATE(-> timestamp(0)) 컬럼은 TO_DATE (TIMESTAMP 리터럴과 비교하면 DATE 컬럼이 변환돼서 인덱스를 못 탐)
+--   DATE 값은 초 단위라 col >= x  ==  col >= ceil(x)
+CREATE FUNCTION pgmig.ora_bound_lit(p_table int, p_col text, p_kind text, p_v numeric) RETURNS text
+LANGUAGE sql STABLE AS $$
+SELECT CASE
+  WHEN p_kind IS DISTINCT FROM 'time' THEN p_v::text
+  WHEN c.tgt_type ~ '^timestamptz'
+    THEN format('TIMESTAMP ''%s +00:00''', to_char(pgmig.epoch_ts(p_v), 'YYYY-MM-DD HH24:MI:SS.US'))
+  WHEN c.tgt_type ~ '^timestamp\(0\)'
+    THEN format('TO_DATE(''%s'', ''YYYY-MM-DD HH24:MI:SS'')', to_char(pgmig.epoch_ts(ceil(p_v)), 'YYYY-MM-DD HH24:MI:SS'))
+  ELSE format('TIMESTAMP ''%s''', to_char(pgmig.epoch_ts(p_v), 'YYYY-MM-DD HH24:MI:SS.US')) END
+  FROM pgmig.columns c WHERE c.table_id = p_table AND c.tgt_col = p_col
+$$;
+
+-- pgmig.cond 의 오라클 버전 (소스에서 직접 count 할 때)
+CREATE FUNCTION pgmig.ora_cond(p_table int, p_col text, p_lo numeric, p_hi numeric, p_kind text) RETURNS text
+LANGUAGE sql STABLE AS $$
+SELECT coalesce(nullif(concat_ws(' AND ',
+  CASE WHEN c IS NOT NULL AND p_lo IS NOT NULL THEN format('%s >= %s', c, pgmig.ora_bound_lit(p_table, p_col, p_kind, p_lo)) END,
+  CASE WHEN c IS NOT NULL AND p_hi IS NOT NULL THEN
+       CASE WHEN p_kind IS NOT NULL AND p_lo IS NULL
+            THEN format('(%s < %s OR %s IS NULL)', c, pgmig.ora_bound_lit(p_table, p_col, p_kind, p_hi), c)
+            ELSE format('%s < %s', c, pgmig.ora_bound_lit(p_table, p_col, p_kind, p_hi)) END END), ''), '1 = 1')
+  FROM (SELECT pgmig.ora_src_col(p_table, p_col) AS c) x
+$$;
+
+CREATE FUNCTION pgmig.src_oracle_stats(p_table int, p_pk text, p_from numeric DEFAULT NULL, p_kind text DEFAULT NULL,
+                                       OUT lo numeric, OUT hi numeric, OUT cnt bigint)
 LANGUAGE plpgsql AS $$
 DECLARE
-  c text := pgmig.ora_src_col(p_table, p_pk);
+  e text := pgmig.ora_split_expr(p_table, p_pk, p_kind);
 BEGIN
   SELECT a, b, s.c::bigint INTO lo, hi, cnt
-    FROM pgmig.ora_scalar3(format('SELECT min(%s), max(%s), count(*) FROM %s', c, c, pgmig.ora_from(p_table))) s;
+    FROM pgmig.ora_scalar3(format('SELECT MIN(%s), MAX(%s), COUNT(*) FROM %s WHERE %s', e, e, pgmig.ora_from(p_table),
+                                  CASE WHEN p_from IS NULL THEN '1 = 1'
+                                       ELSE pgmig.ora_cond(p_table, p_pk, p_from, NULL, p_kind) END)) s;
 END $$;
 
-CREATE FUNCTION pgmig.src_oracle_count(p_table int, p_pk text, p_lo numeric, p_hi numeric) RETURNS bigint
-LANGUAGE plpgsql AS $$
+CREATE FUNCTION pgmig.src_oracle_count(p_table int, p_pk text, p_lo numeric, p_hi numeric, p_kind text DEFAULT NULL)
+RETURNS bigint LANGUAGE plpgsql AS $$
 DECLARE
-  c text := pgmig.ora_src_col(p_table, p_pk);
-  w text;
   r bigint;
 BEGIN
-  w := concat_ws(' AND ',
-         CASE WHEN c IS NOT NULL AND p_lo IS NOT NULL THEN format('%s >= %s', c, p_lo) END,
-         CASE WHEN c IS NOT NULL AND p_hi IS NOT NULL THEN format('%s < %s', c, p_hi) END);
   SELECT a::bigint INTO r
-    FROM pgmig.ora_scalar3(format('SELECT count(*), 0, 0 FROM %s%s', pgmig.ora_from(p_table),
-                                  CASE WHEN w <> '' THEN ' WHERE ' || w ELSE '' END));
+    FROM pgmig.ora_scalar3(format('SELECT COUNT(*), 0, 0 FROM %s WHERE %s', pgmig.ora_from(p_table),
+                                  CASE WHEN p_pk IS NULL THEN '1 = 1'
+                                       ELSE pgmig.ora_cond(p_table, p_pk, p_lo, p_hi, p_kind) END));
   RETURN r;
 END $$;
 
--- 분위수 경계: 오라클에서 NTILE 로 계산해 경계값만 가져옴 (PK 인덱스 1회 정렬 스캔)
---   ORA_USE_SCN 이면 같은 SCN 기준. n 개 버킷 시작값 중 첫 번째를 뺀 값들
-CREATE FUNCTION pgmig.src_oracle_bounds(p_table int, p_pk text, p_n int) RETURNS numeric[]
+-- 분위수 경계: 오라클에서 NTILE 로 계산해 경계값만 가져옴 (분할 컬럼 1회 정렬 스캔)
+--   ORA_USE_SCN 이면 같은 SCN 기준. n 개 버킷 시작값 중 첫 번째를 뺀 값들. NULL 은 제외(첫 청크에 들어감)
+CREATE FUNCTION pgmig.src_oracle_bounds(p_table int, p_pk text, p_n int, p_kind text DEFAULT NULL) RETURNS numeric[]
 LANGUAGE plpgsql AS $$
 DECLARE
   c   text := pgmig.ora_src_col(p_table, p_pk);
+  e   text := pgmig.ora_split_expr(p_table, p_pk, p_kind);
   nm  text := 'qb_' || pg_backend_pid();
   q   text;
   r   numeric[];
 BEGIN
-  q := format('SELECT MIN(%1$s) AS b FROM (SELECT %1$s, NTILE(%2$s) OVER (ORDER BY %1$s) AS t FROM %3$s) GROUP BY t',
-              c, p_n, pgmig.ora_from(p_table));
+  q := format('SELECT MIN(v) AS b FROM (SELECT %1$s AS v, NTILE(%2$s) OVER (ORDER BY %3$s) AS t FROM %4$s WHERE %3$s IS NOT NULL) GROUP BY t',
+              e, p_n, c, pgmig.ora_from(p_table));
   EXECUTE format('DROP FOREIGN TABLE IF EXISTS pgmig_stage.%I', nm);
   EXECUTE format('CREATE FOREIGN TABLE pgmig_stage.%I (b numeric) SERVER pgmig_src OPTIONS (table %L, readonly ''true'')',
                  nm, '(' || q || ')');

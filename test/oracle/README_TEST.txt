@@ -5,6 +5,7 @@ pgmig Oracle -> PostgreSQL 실전 테스트 가이드
   01_oracle_testdata.sql         오라클에 테스트 스키마/데이터 생성 (성공 + 실패 케이스 전부)
   02_oracle_change_after_load.sql 시나리오 A: 이관 후 소스가 바뀐 경우
   03_pg_corrupt_target.sql       시나리오 B: target 데이터가 깨진 경우
+  04_oracle_daily_changes.sql    시나리오 D: 며칠에 나눠 이관하는 도중 소스가 바뀌는 경우 (마감 / SPLIT_COLS / sync)
   check_result.sql               target 에서 결과 자동 확인 (PASS/FAIL/SKIP)
   ../../conf/pgmig.conf.oracle-test  이 테스트용 설정
 
@@ -134,6 +135,32 @@ pgmig Oracle -> PostgreSQL 실전 테스트 가이드
     ./pgmig.sh data 실행 중 Ctrl+C (또는 PG 세션 kill)
     -> 다시 ./pgmig.sh data : 끝난 청크는 건너뛰고 나머지만 진행, 반쪽 적재 없음
     (처음부터 해보려면: psql 로 DROP SCHEMA app, ref CASCADE; ./pgmig.sh cleanup --force; install 부터)
+
+[D] 매일 정해진 시간씩 나눠 이관 + 기간 중 소스 변경 (마감 / SPLIT_COLS / sync)
+    처음부터 새로: psql 로 DROP SCHEMA app, ref CASCADE; ./pgmig.sh cleanup --force
+    conf/pgmig.conf 에 추가:
+      CHUNK_ROWS=1000                                   # ORDERS 를 300청크로 -> 마감에 걸리게
+      SPLIT_COLS='PGMIG_SRC.NO_PK_LOG:LOG_TIME'         # PK 없는 로그 테이블을 TIMESTAMP 컬럼으로 분할
+      ORA_STRIP_ZEROS=on
+    (1) ./pgmig.sh install ; ./pgmig.sh analyze ; ./pgmig.sh schema
+        기대: NO_PK_LOG 3청크 (리포트 8번 INFO "분할 컬럼 log_time (time) 로 3청크"), "1청크" WARN 없음
+    (2) ./pgmig.sh data --max-minutes 1 --stop-before 0 ; echo $?
+        기대: 1분 안에 멈춤, "마감으로 멈춤: 남은 청크 N개", 종료코드 3
+              ./pgmig.sh status -> 남은 청크 / 청크 평균(초) / 남은 적재 예상(분)
+              psql: SELECT status, count(*) FROM pgmig.tasks GROUP BY 1   -> running/failed 없음
+    (3) sqlplus ... @test/oracle/04_oracle_daily_changes.sql      (이관 도중 소스 변경)
+    (4) ./pgmig.sh data       (남은 청크 이어서 -> 완료)
+        ./pgmig.sh index
+    (5) ./pgmig.sh sync ; echo $?
+        기대: [1/4] 표에 app.orders (신규 3000 -> 새 청크 3개 = 3000/CHUNK_ROWS), app.no_pk_log (신규 200 -> 1개)
+              [3/4] 불일치: ORDERS 450000 / 600000 이 든 청크, NO_PK_LOG 첫 청크(NULL 행), ORDER_ITEM
+              [4/4] 그 청크만 재이관 -> "sync 완료: 전 청크 소스와 일치", 종료코드 0
+        확인: psql: SELECT count(*) FROM app.orders;  SELECT count(*) FROM app.no_pk_log;
+              -> 04 스크립트 마지막에 출력된 오라클 건수와 같아야 함
+              psql: SELECT note FROM app.orders WHERE order_id = 450000;  -> '기간 중 변경'
+    (6) ./pgmig.sh sync 한 번 더 -> 새 청크 없음, 재이관 없음
+    다르게 나오면 볼 것: 날짜 분할 조건의 push down (oracle_fdw 디버그: SET client_min_messages = debug2 후
+                        EXPLAIN VERBOSE SELECT count(*) FROM pgmig_stage.t<id> WHERE <리포트의 청크 조건>)
 
 
 6. 정리
