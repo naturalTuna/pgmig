@@ -66,6 +66,10 @@ test/oracle/                    실제 오라클로 하는 테스트 (데이터 
   ./pgmig.sh report r.txt  # 최종 리포트 r.txt + 수동 작업 폴더 r_manual/
   ./pgmig.sh resolved 85   # 실패 DDL #85 를 수동으로 처리했다고 표시
   ./pgmig.sh cleanup       # 전 청크 검증 OK 일 때만 삭제됨 (최종 리포트 자동 저장)
+  ./pgmig.sh sync          # 이관 기간 중 소스 변경분 반영 (4-(7) 참고)
+
+  data / verify / repair / sync / run 에 마감 옵션:  --until 04:00 | --max-minutes 180 | --stop-before 15
+  (매일 정해진 시간만 이관하는 법은 4-(7))
 
   한 번에:  ./pgmig.sh run    (cleanup 직전까지. 검증 실패 시 FK 전에 멈춤)
   설정은 명령마다 다시 읽음 -> conf 고치고 같은 명령 다시 실행하면 적용 (예: ORA_STRIP_ZEROS)
@@ -82,6 +86,7 @@ test/oracle/                    실제 오라클로 하는 테스트 (데이터 
 ---------------------------------------------------------------------
 (1) 청크 = 이관/검증/재이관의 단위
     숫자 PK (단일, 또는 복합 PK 의 숫자 선두 컬럼) 테이블은 CHUNK_ROWS 단위 범위로 쪼개고,
+    SPLIT_COLS 로 지정한 테이블은 그 날짜/숫자 컬럼으로 쪼개고 (아래 (7)),
     나머지는 테이블 통째로 1청크 (CHUNK_ROWS x 2 보다 크면 analyze/schema 단계에서 WARN).
     경계값은 CHUNK_SPLIT=quantile(기본) 이면 소스에서 PK 분위수(NTILE)로 정함
       -> ID 가 1~29000 + 1조 근처처럼 치우쳐도 청크 크기가 고름 (균등 분할이면 한 청크에 몰림)
@@ -112,14 +117,66 @@ test/oracle/                    실제 오라클로 하는 테스트 (데이터 
     기본은 "소스 서비스 중지 후 이관" 전제. 청크마다 읽는 시점이 다르기 때문.
     Oracle 은 ORA_USE_SCN=on 으로 모든 청크/검증을 같은 SCN 시점으로 읽을 수 있음(flashback query).
     단 undo 보존 기간 안에 끝나야 하고(ORA-01555), 그 시점 이후 변경분은 이 툴이 따라가지 않음(CDC 아님).
+    며칠에 걸쳐 나눠 이관하면서 소스가 계속 바뀌는 경우는 (7) 의 sync 로 따라잡음.
+
+(7) 큰 테이블을 매일 정해진 시간씩 나눠 이관 (예: 매일 01:00~04:00, 몇 주간)
+    [마감 시각 graceful stop]
+      ./pgmig.sh data --until 04:00                 04:00 마감 (지난 시각이면 다음 날 04:00)
+      ./pgmig.sh data --max-minutes 180             지금부터 3시간
+      conf 로 고정: UNTIL=04:00 / MAX_MINUTES=180, STOP_BEFORE_MIN=15
+      - 마감 STOP_BEFORE_MIN 분 전(기본 10)부터는 새 청크를 시작하지 않음
+      - 그 테이블 청크 평균 소요시간 안에 마감 전까지 못 끝낼 청크도 시작하지 않음
+        (긴 청크는 건너뛰고, 남은 시간에 끝낼 수 있는 다른 테이블의 짧은 청크는 계속)
+      - 진행 중인 청크는 끝까지 적재 후 커밋 -> 반쪽 적재 없음. 남은 청크는 다음 실행에서 이어서
+      - 종료 코드 3 = 마감으로 멈춤(남은 작업 있음). cron 에서 실패(1)와 구분 가능
+      - 청크 하나가 마감 여유(STOP_BEFORE_MIN)보다 오래 걸리면 마감을 넘길 수 있음
+        -> status 의 "청크 평균(초)" 보고 CHUNK_ROWS 를 줄이거나 STOP_BEFORE_MIN 을 늘릴 것
+      - status 에 남은 청크 / 청크 평균 소요 / 남은 적재 예상 시간(분) 표시
+      cron 예)  0 1 * * * cd /opt/pgmig && ./pgmig.sh data --until 04:00 >> data_$(date +\%m\%d).log 2>&1
+
+    [숫자 PK 가 없는 큰 테이블: 분할 컬럼 지정]
+      SPLIT_COLS='HR.ACCESS_LOG:LOG_TIME,HR.EVENTS:SEQ_NO'     (SCHEMA.TABLE:컬럼, 소스 이름 기준)
+      - 숫자 / DATE / TIMESTAMP 컬럼. 유일할 필요 없음, NULL 있어도 됨 (NULL 행은 첫 청크에 포함)
+      - 경계는 PK 와 같은 방식 (분위수, 첫 청크 하한 / 마지막 청크 상한 없음 -> 누락 없음)
+      - 숫자 PK 가 있는 테이블에 지정하면 PK 대신 그 컬럼으로 분할
+      - schema(청크 계획) 전에 설정. 이미 계획된 테이블은 다시 계획하지 않음
+      - 날짜 경계는 UTC epoch 로 계산해서 양쪽에 같은 시각 리터럴로 보냄
+        (오라클 DATE 컬럼은 TO_DATE 로 보내 인덱스를 탈 수 있게)
+      - 소스에 그 컬럼 인덱스가 없으면 청크마다 소스 풀스캔. 대형이면 인덱스 있는 컬럼을 고를 것
+      - target 에도 그 컬럼 인덱스가 없으면 verify/sync 가 청크마다 target 풀스캔
+        -> 오래 걸리면 target 에 임시 인덱스를 만들어 두고 끝나고 지울 것 (PK 가 아니므로 index 단계에서 안 만들어짐)
+      - 행이 다른 청크로 옮겨가는 UPDATE(분할 컬럼 값 변경)도 sync 의 verify/redo 가 양쪽 청크를 다 맞춤
+
+    [이관 기간 중 소스 변경분: sync]
+      ./pgmig.sh sync [--until 04:00]
+        1) 범위 밖 신규 행: 적재가 끝난 마지막 청크(상한 없음)를 "target 에 적재된 최대값 다음"에서 닫고,
+           그 뒤를 새 청크로 추가 (신규 행이 많으면 CHUNK_ROWS 단위로 여러 개)
+           -> 신규 행만 가져옴 (마지막 청크 전체를 다시 넣지 않음)
+        2) 대기 청크 적재 (신규 청크 + 전날 마감으로 못 한 청크)
+        3) 전 청크 재검증 (VERIFY_MODE, full 권장) — 검증한 지 오래된 청크부터.
+           마감에 걸려도 다음 sync 가 이어서 돌므로 며칠에 걸쳐 한 바퀴 돎
+        4) 불일치 청크(기존 범위 안의 UPDATE / DELETE / 늦게 들어온 작은 ID) 만 삭제 후 재이관 -> 재검증
+      ORA_USE_SCN=on 이면 sync 할 때마다 새 SCN 으로 다시 읽음 (ORA_SCN 을 conf 에 고정했으면 그대로)
+
+    [권장 운영 순서]
+      1일차      install -> analyze -> report 확인 -> schema
+      매일       data --until 04:00                     (적재 끝날 때까지. 종료 코드 3 이면 내일 계속)
+      적재 완료  index                                   (PK 가 있어야 verify/sync 가 빠름)
+      매일       sync --until 04:00                     (선택: 변경분을 미리 따라가서 컷오버 시간 단축)
+      컷오버     소스 서비스 중지 -> sync (마감 없이)      -> 종료 코드 0 = 전 청크가 멈춘 소스와 일치
+                 -> fk -> view -> report -> cleanup
+      * 컷오버 다운타임 = 마지막 sync 시간 (신규 범위 적재 + 전 청크 full 검증 + 불일치 재이관)
+        full 검증은 소스를 전부 다시 읽으므로, 대형 DB 면 그 시간을 미리 재 볼 것
+      * 기존 범위 안의 변경은 "검증 -> 청크 통째로 재이관" 이라 변경이 고르게 퍼진 테이블은 재이관량이 큼
+        (행 단위 CDC 가 아님). 그런 테이블은 컷오버 때 한 번에 처리하는 게 나음
 
 한계 (알고 쓸 것)
     - full 검증은 "FDW 가 읽어준 값" 끼리 비교함. 즉 적재 누락/중복/변조는 잡지만,
       FDW 의 타입 변환 자체가 틀린 경우(예: 문자셋 변환)는 같은 값으로 보임
       -> 한글/특수문자 컬럼은 소스 툴(sqlplus)로 몇 건 직접 눈으로 대조 권장
-    - PK 없는 테이블은 청크 분할/diff 불가 (통째로 이관·검증·재이관)
+    - PK 없는 테이블은 diff 불가. 청크 분할은 SPLIT_COLS 로 컬럼을 지정했을 때만 (아니면 통째로 이관·검증·재이관)
     - 문자 PK(VARCHAR2 등) 테이블도 1청크. 오라클 정렬(NLS)과 PG collation 이 달라
-      청크 경계가 양쪽에서 다르게 잘릴 수 있어 아직 분할하지 않음 (대형이면 WARN)
+      청크 경계가 양쪽에서 다르게 잘릴 수 있어 아직 분할하지 않음 (대형이면 WARN -> SPLIT_COLS 로 날짜/숫자 컬럼 지정)
     - repair 는 FK/트리거를 끈 상태(session_replication_role=replica)로 지웠다 다시 넣음
       -> 끝나고 관련 FK 의 고아 행을 자동 검사해서 있으면 WARN + 이슈 기록 (차단은 안 함)
 
@@ -202,7 +259,8 @@ test/oracle/                    실제 오라클로 하는 테스트 (데이터 
   ora2pg              사실상 표준. PL/SQL 변환 시도, 이관 비용 산정 리포트, 병렬, 데이터 비교 테스트.
                       pgmig 는 PL/SQL 을 목록/가이드로만 넘김 -> 코드 변환은 ora2pg 쪽이 강함
   ora_migrator        (CYBERTEC) pgmig 와 같은 구조 (oracle_fdw + PG 안의 staging). 증분(incremental) 이관 지원
-                      -> pgmig 는 CDC/증분 없음 = 다운타임이 전체 이관 시간
+                      -> pgmig 는 CDC 없음. 대신 매일 시간 나눠 이관 + sync(범위 밖 신규 행 추가, verify+청크 재이관)로
+                         컷오버 다운타임을 "마지막 sync 시간" 으로 줄임 (행 단위 증분은 아님)
   AWS SCT + DMS       CDC 포함, 클라우드 전제
   pgmig 강점          청크 단위 검증 -> diff(PK 지목) -> repair -> cleanup 게이트 로 이어지는 정합성 루프,
                       bash + psql 만 (폐쇄망), 끝나면 툴 흔적 제거
@@ -211,17 +269,22 @@ test/oracle/                    실제 오라클로 하는 테스트 (데이터 
 7. 테스트 상태 (솔직하게)
 ---------------------------------------------------------------------
 검증된 것
-  - test/selftest.sh (PG16 + postgres_fdw) 37개 항목 통과
+  - test/selftest.sh (PG16 + postgres_fdw) 68개 항목 통과
       install ~ cleanup 전체 흐름, 병렬 청크 이관, count/full 검증, 누락·변조·초과 탐지,
       diff, repair, 중단된 청크 재시도, cleanup 게이트,
       PK 치우침 분위수 분할(최대 청크 29000 -> 10000행), 복합 PK 선두 컬럼 분할,
-      문자 PK 대형 테이블 WARN, repair 후 FK 고아 행 검출
+      문자 PK 대형 테이블 WARN, repair 후 FK 고아 행 검출,
+      마감 graceful stop (conf/옵션, 진행 중 청크 커밋, 평균 소요시간 기반 청크 건너뛰기, 다음 실행 이어가기),
+      SPLIT_COLS (문자 PK 테이블을 시각 컬럼으로 / PK 없는 테이블을 중복·NULL 있는 숫자 컬럼으로),
+      sync (PK·시각 범위 밖 신규 행 -> 새 청크, 기존 범위 UPDATE/DELETE -> verify+redo, 소스와 전 컬럼 해시 일치)
   - test/mock_oracle/run_mock.sh : test/oracle 데이터와 같은 모양의 가짜 오라클 딕셔너리로
       타입 매핑, 파티션 DDL 과 실제 행 라우팅, 뷰 변환/의존 재시도, default/시퀀스/identity,
-      실패 DDL 가이드, 수동 작업 폴더, resolved / 수동 생성 뷰 감지
+      실패 DDL 가이드, 수동 작업 폴더, resolved / 수동 생성 뷰 감지,
+      분할 컬럼 오라클 범위 조건 생성 (DATE -> TO_DATE, TIMESTAMP, NULL 포함 첫 청크)
 
 아직 실제 Oracle 에 붙여보지 못한 것 (개발 환경에서 Oracle 이미지를 받을 수 없었음)
-  - 오라클 딕셔너리 조회 쿼리, oracle_fdw 데이터 변환, SCN 고정 읽기
+  - 오라클 딕셔너리 조회 쿼리, oracle_fdw 데이터 변환, SCN 고정 읽기,
+    날짜 분할 컬럼 조건의 oracle_fdw push down (README_TEST 시나리오 D)
   -> test/oracle/README_TEST.txt 순서대로 한 번 돌려보고, 기대와 다른 출력이 있으면 그대로 공유
 
 
@@ -231,6 +294,8 @@ sql/src_<type>.sql 에 아래 4개만 구현하면 core 는 그대로 씀.
   PROCEDURE pgmig.src_<type>_catalog()                   pgmig.tables/columns/constraints/indexes/sequences/
                                                          partitions/comments/views/issues 채우기
   FUNCTION  pgmig.src_<type>_stage_sql(table_id) text    CREATE FOREIGN TABLE pgmig_stage.t<id> ... 문 반환
-  FUNCTION  pgmig.src_<type>_stats(table_id, pk)         (lo, hi, cnt) 반환
-  FUNCTION  pgmig.src_<type>_count(table_id, pk, lo, hi) bigint 반환
+  FUNCTION  pgmig.src_<type>_stats(table_id, col, from, kind)    (lo, hi, cnt) 반환. from 이 있으면 col >= from 범위만
+  FUNCTION  pgmig.src_<type>_count(table_id, col, lo, hi, kind)  bigint 반환
+    kind: NULL(숫자 PK) / num / time(lo/hi 는 epoch 초). 범위는 pgmig.cond(col, lo, hi, kind) 와 같아야 함
+  (선택) FUNCTION pgmig.src_<type>_bounds(table_id, col, n, kind)  numeric[] 분위수 경계 (없으면 균등 분할)
 그리고 pgmig.sh 의 cmd_install 에 CREATE SERVER 옵션 한 줄 추가.

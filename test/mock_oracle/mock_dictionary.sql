@@ -420,7 +420,8 @@ BEGIN
 END $body$;
 
 -- 데이터 접근이 필요한 부분 흉내 (청크 계획용 min/max/count)
-CREATE OR REPLACE FUNCTION pgmig.src_oracle_stats(p_table int, p_pk text, OUT lo numeric, OUT hi numeric, OUT cnt bigint)
+CREATE OR REPLACE FUNCTION pgmig.src_oracle_stats(p_table int, p_pk text, p_from numeric DEFAULT NULL, p_kind text DEFAULT NULL,
+                                                   OUT lo numeric, OUT hi numeric, OUT cnt bigint)
 LANGUAGE sql AS $$
   SELECT CASE t.src_table WHEN 'ORDERS' THEN 3 ELSE 1 END::numeric,
          CASE t.src_table WHEN 'ORDERS' THEN 900000 ELSE t.est_rows END::numeric,

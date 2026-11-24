@@ -27,8 +27,16 @@ CHUNK_ROWS=500000      # 숫자 PK(단일 또는 복합 PK 의 숫자 선두 컬
 #CHUNK_SPLIT=quantile  # quantile(기본) = 소스 PK 분위수로 경계 (ID 가 치우쳐도 청크 크기 균일)
                        # uniform = (max-min)/n 균등 분할 (소스에서 PK 정렬 1회도 아끼고 싶을 때)
 #CHUNK_ALWAYS_COUNT=on # 소스 통계(num_rows)를 못 믿을 때: 항상 실제 count 로 청크 계산
+#SPLIT_COLS='HR.ACCESS_LOG:LOG_TIME,HR.EVENTS:SEQ_NO'
+                       # 숫자 PK 가 없는(또는 PK 대신 쓸) 큰 테이블의 분할 컬럼. SCHEMA.TABLE:컬럼, 숫자/DATE/TIMESTAMP
+                       # 중복/NULL 있어도 됨 (NULL 은 첫 청크). schema(청크 계획) 전에 설정
 VERIFY_MODE=full       # full = 건수 + 전 컬럼 해시 (소스를 한 번 더 읽음) / count = 건수만
 PROGRESS_SEC=5
+
+# ---- 마감 (매일 정해진 시간만 이관할 때. data/verify/repair/sync/run 에 적용, 명령행 옵션이 우선) ----
+#UNTIL=04:00           # 이 시각까지 (지난 시각이면 다음 날). 명령행: --until 04:00
+#MAX_MINUTES=180       # 지금부터 N 분까지 (UNTIL 과 같이 쓰면 빠른 쪽). 명령행: --max-minutes 180
+#STOP_BEFORE_MIN=10    # 마감 N 분 전부터 새 청크 시작 안 함 (진행 중 청크는 끝까지). 명령행: --stop-before 10
 
 # ---- oracle 옵션 ----
 ORA_DICT=all           # all = ALL_* 뷰 / dba = DBA_* 뷰 (SELECT ANY DICTIONARY 필요)

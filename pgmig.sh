@@ -21,6 +21,7 @@ usage() {
   analyze            소스 카탈로그 수집, 타입 매핑, 이슈 점검
   schema             target 스키마/테이블 생성, stage foreign table 생성, 청크 계획
   data               데이터 이관 (병렬 JOBS). 실패/중단된 청크만 다시 돌림
+  sync               이관 기간 중 소스 변경분 반영: 범위 밖 신규 행 -> 새 청크 적재, 전 청크 재검증, 불일치 재이관
   index              PK/UK/인덱스/CHECK/시퀀스/default/identity/코멘트 생성 + ANALYZE (실패분만 재시도)
   verify [count|full]  정합성 검증 (기본 VERIFY_MODE)
   diff <태스크id> [n]  불일치 청크에서 다른 행의 PK 를 n 개까지 출력
@@ -34,6 +35,13 @@ usage() {
   run                install(미설치 시) -> analyze -> schema -> data -> index -> verify -> fk -> view -> report
 
 권장 순서: install -> analyze -> (report 로 이슈 확인) -> schema -> data -> index -> verify -> fk -> view -> report -> cleanup
+
+마감 옵션 (data / verify / repair / sync / run) — 매일 정해진 시간만 이관할 때
+  --until HH:MM[:SS] | 'YYYY-MM-DD HH:MM'   이 시각까지 (지난 시각이면 다음 날)     conf: UNTIL
+  --max-minutes N                          지금부터 N 분까지                        conf: MAX_MINUTES
+  --stop-before N                          마감 N 분 전부터 새 청크 시작 안 함 (기본 10)  conf: STOP_BEFORE_MIN
+  진행 중인 청크는 끝까지 적재(커밋)하고 멈춤. 남은 청크는 다음 실행에서 이어서 진행
+  종료 코드: 0 완료 / 1 실패·불일치 / 3 마감으로 멈춤(남은 작업 있음)
 EOF
 }
 
@@ -64,7 +72,7 @@ need_installed() { installed || die "pgmig 미설치. 먼저: $(basename "$0") i
 # conf 파일의 조정 가능한 값을 매 명령마다 DB(pgmig.config) 에 반영 -> conf 고치고 다시 실행하면 적용됨
 #   (src_type/서버 접속정보는 install 때만. ORA_SCN 은 비어 있으면 자동으로 잡은 값을 유지)
 CONF_KEYS=(schemas:SRC_SCHEMAS schema_map:SCHEMA_MAP exclude_tables:EXCLUDE_TABLES chunk_rows:CHUNK_ROWS
-           chunk_split:CHUNK_SPLIT
+           chunk_split:CHUNK_SPLIT split_cols:SPLIT_COLS
            chunk_always_count:CHUNK_ALWAYS_COUNT ora_dict:ORA_DICT ora_use_scn:ORA_USE_SCN ora_prefetch:ORA_PREFETCH
            ora_lob_prefetch:ORA_LOB_PREFETCH ora_max_long:ORA_MAX_LONG ora_strip_zeros:ORA_STRIP_ZEROS
            ora_partitions:ORA_PARTITIONS)
@@ -78,6 +86,47 @@ sync_conf() {
   if [ -n "${ORA_SCN:-}" ]; then args+=(-v "ora_scn=$ORA_SCN"); vals+=",('ora_scn', :'ora_scn')"; fi
   echo "INSERT INTO pgmig.config (key, value) VALUES $vals ON CONFLICT (key) DO UPDATE SET value = excluded.value;" \
     | "${PSQL[@]}" "${args[@]}" -f - >/dev/null
+}
+
+# ---------------------------------------------------------------------
+# 마감 시각 (graceful stop). DEADLINE/STOP 은 epoch 초, 없으면 빈 값
+#   STOP = DEADLINE - STOP_BEFORE_MIN 분 : 이 시각 이후엔 새 청크를 시작하지 않음
+# ---------------------------------------------------------------------
+DEADLINE=""; STOP=""; DL_STOP=NULL; DL_END=NULL
+set_deadline() {
+  local now t
+  now=$(date +%s)
+  if [ -n "${UNTIL:-}" ]; then
+    if [[ "$UNTIL" =~ ^[0-9]{1,2}:[0-9]{2}(:[0-9]{2})?$ ]]; then
+      t=$(date -d "today $UNTIL" +%s) || die "--until 시각 형식 오류: $UNTIL"
+      [ "$t" -gt "$now" ] || t=$(date -d "tomorrow $UNTIL" +%s)
+    else
+      t=$(date -d "$UNTIL" +%s 2>/dev/null) || die "--until 형식: HH:MM[:SS] 또는 'YYYY-MM-DD HH:MM[:SS]' (입력: $UNTIL)"
+    fi
+    DEADLINE=$t
+  fi
+  if [ -n "${MAX_MINUTES:-}" ]; then
+    [[ "$MAX_MINUTES" =~ ^[0-9]+$ ]] || die "MAX_MINUTES / --max-minutes 는 0 이상의 정수(분)"
+    t=$((now + MAX_MINUTES * 60))
+    if [ -z "$DEADLINE" ] || [ "$t" -lt "$DEADLINE" ]; then DEADLINE=$t; fi
+  fi
+  [ -n "$DEADLINE" ] || return 0
+  local m=${STOP_BEFORE_MIN:-10}
+  [[ "$m" =~ ^[0-9]+$ ]] || die "STOP_BEFORE_MIN / --stop-before 는 0 이상의 정수(분)"
+  STOP=$((DEADLINE - m * 60))
+  DL_STOP="to_timestamp($STOP)"; DL_END="to_timestamp($DEADLINE)"
+}
+dl_msg() {
+  [ -n "$DEADLINE" ] || return 0
+  printf ', 마감 %s (새 청크는 %s 까지만 시작)' "$(date -d "@$DEADLINE" '+%m-%d %H:%M:%S')" "$(date -d "@$STOP" '+%H:%M:%S')"
+}
+time_up() { [ -n "$STOP" ] && [ "$(date +%s)" -ge "$STOP" ]; }
+
+# 실패/중단된 청크를 다시 대기 상태로. 살아 있는 세션(다른 실행)이 잡고 있는 running 은 건드리지 않음
+reset_stale() {
+  q "UPDATE pgmig.tasks SET status = 'pending', pid = NULL
+      WHERE status = 'failed'
+         OR (status = 'running' AND (pid IS NULL OR pid NOT IN (SELECT pid FROM pg_stat_activity)))" >/dev/null
 }
 
 # 워커 N 개를 띄우고 끝날 때까지 진행 상황 출력.  $1=워커 SQL  $2=진행상황 SQL
@@ -197,14 +246,32 @@ PROG_DATA="SELECT format('청크 %s/%s 완료, 실패 %s, 적재 %s rows', count
 cmd_data() {
   need_installed
   [ "$(q "SELECT count(*) FROM pgmig.tasks")" != "0" ] || die "청크 없음 (schema 먼저)"
-  q "UPDATE pgmig.tasks SET status = 'pending' WHERE status IN ('running', 'failed')"
+  if time_up; then log "이미 마감 시각$(dl_msg) -> 시작하지 않음"; return 3; fi
+  reset_stale
   # 남은 청크의 stage 테이블은 현재 설정(ORA_STRIP_ZEROS, ORA_MAX_LONG 등)으로 다시 만듦
   q "CALL pgmig.make_stage(true)"
-  log "데이터 이관 시작 (JOBS=$JOBS)"
-  run_workers "CALL pgmig.worker()" "$PROG_DATA"
-  if [ "$(q "SELECT count(*) FROM pgmig.tasks WHERE status <> 'done'")" != "0" ]; then
-    qt "SELECT k.id AS task, pgmig.rel(k.table_id) AS tbl, pgmig.cond(k.pk_col, k.lo, k.hi) AS chunk, k.status, k.error FROM pgmig.tasks k WHERE k.status <> 'done' ORDER BY k.id LIMIT 30"
+  log "데이터 이관 시작 (JOBS=$JOBS$(dl_msg))"
+  load_chunks
+}
+
+# 대기 청크 적재 + 결과 판정 (0 완료 / 1 실패 / 3 마감으로 남음)
+load_chunks() {
+  run_workers "CALL pgmig.worker($DL_STOP, $DL_END)" "$PROG_DATA"
+  if [ "$(q "SELECT count(*) FROM pgmig.tasks WHERE status = 'failed'")" != "0" ]; then
+    qt "SELECT k.id AS task, pgmig.rel(k.table_id) AS tbl, pgmig.cond(k.pk_col, k.lo, k.hi, k.split_kind) AS chunk, k.status, k.error FROM pgmig.tasks k WHERE k.status = 'failed' ORDER BY k.id LIMIT 30"
     log "실패한 청크가 있음. 원인 해결 후 data 를 다시 실행하면 실패분만 재시도"
+    return 1
+  fi
+  local left
+  left=$(q "SELECT count(*) FROM pgmig.tasks WHERE status <> 'done'")
+  if [ "$left" != "0" ] && [ -n "$DEADLINE" ]; then
+    log "마감으로 멈춤: 남은 청크 ${left}개 (진행 중이던 청크는 커밋 완료). 다음 실행에서 이어서 진행"
+    qt "SELECT pgmig.rel(table_id) AS tbl, count(*) AS \"남은 청크\" FROM pgmig.tasks WHERE status <> 'done' GROUP BY table_id ORDER BY table_id"
+    return 3
+  fi
+  if [ "$left" != "0" ]; then
+    qt "SELECT k.id AS task, pgmig.rel(k.table_id) AS tbl, pgmig.cond(k.pk_col, k.lo, k.hi, k.split_kind) AS chunk, k.status FROM pgmig.tasks k WHERE k.status <> 'done' ORDER BY k.id LIMIT 30"
+    log "끝나지 않은 청크 ${left}개 (다른 실행이 진행 중이거나 워커가 비정상 종료). 다시 실행하면 이어서 진행"
     return 1
   fi
   log "데이터 이관 완료"
@@ -227,14 +294,20 @@ run_ddl_phase() {  # $1=phase  $2=설명
   fi
 }
 
-do_verify() {  # $1=mode ; v_status='pending' 인 청크만 검증
-  run_workers "CALL pgmig.verify_worker('$1')" \
+do_verify() {  # $1=mode ; v_status='pending' 인 청크만 검증.  0 OK / 1 불일치·미검증 / 3 마감으로 남음
+  run_workers "CALL pgmig.verify_worker('$1', $DL_STOP)" \
     "SELECT format('검증 %s/%s, OK %s, 불일치 %s, 에러 %s', count(*) FILTER (WHERE v_status IN ('ok', 'mismatch', 'error')), count(*), count(*) FILTER (WHERE v_status = 'ok'), count(*) FILTER (WHERE v_status = 'mismatch'), count(*) FILTER (WHERE v_status = 'error')) FROM pgmig.tasks WHERE status = 'done'"
-  q "UPDATE pgmig.tasks SET v_status = 'pending' WHERE v_status = 'running'" >/dev/null
-  local bad
+  q "UPDATE pgmig.tasks SET v_status = 'pending', pid = NULL
+      WHERE v_status = 'running' AND (pid IS NULL OR pid NOT IN (SELECT pid FROM pg_stat_activity))" >/dev/null
+  local bad left
+  left=$(q "SELECT count(*) FROM pgmig.tasks WHERE status = 'done' AND v_status = 'pending'")
+  if [ "$left" != "0" ] && [ -n "$DEADLINE" ]; then
+    log "마감으로 검증 멈춤: 미검증 청크 ${left}개 (다음 실행에서 검증한 지 오래된 것부터 이어서)"
+    return 3
+  fi
   bad=$(q "SELECT count(*) FROM pgmig.tasks WHERE status <> 'done' OR v_status IS DISTINCT FROM 'ok'")
   if [ "$bad" != "0" ]; then
-    qt "SELECT k.id AS task, pgmig.rel(k.table_id) AS tbl, pgmig.cond(k.pk_col, k.lo, k.hi) AS chunk, k.status, coalesce(k.v_status, '-') AS verify, k.src_cnt, k.tgt_cnt, k.v_error FROM pgmig.tasks k WHERE k.status <> 'done' OR k.v_status IS DISTINCT FROM 'ok' ORDER BY k.id LIMIT 30"
+    qt "SELECT k.id AS task, pgmig.rel(k.table_id) AS tbl, pgmig.cond(k.pk_col, k.lo, k.hi, k.split_kind) AS chunk, k.status, coalesce(k.v_status, '-') AS verify, k.src_cnt, k.tgt_cnt, k.v_error FROM pgmig.tasks k WHERE k.status <> 'done' OR k.v_status IS DISTINCT FROM 'ok' ORDER BY k.id LIMIT 30"
     log "정합성 불일치/미검증 청크 ${bad}개.  행 확인: diff <task>   재이관: repair"
     return 1
   fi
@@ -246,8 +319,9 @@ cmd_verify() {
   local mode=${1:-$VERIFY_MODE}
   case "$mode" in count|full) ;; *) die "검증 모드는 count 또는 full" ;; esac
   [ "$(q "SELECT count(*) FROM pgmig.tasks WHERE status = 'done'")" != "0" ] || die "이관 완료된 청크 없음"
+  if time_up; then log "이미 마감 시각$(dl_msg) -> 시작하지 않음"; return 3; fi
   q "UPDATE pgmig.tasks SET v_status = 'pending' WHERE status = 'done'" >/dev/null
-  log "정합성 검증 시작 (mode=$mode, JOBS=$JOBS)"
+  log "정합성 검증 시작 (mode=$mode, JOBS=$JOBS$(dl_msg))"
   do_verify "$mode"
 }
 
@@ -260,14 +334,18 @@ cmd_diff() {
 
 cmd_repair() {
   need_installed
-  local n ids
-  ids=$(q "SELECT coalesce(string_agg(DISTINCT table_id::text, ','), '') FROM pgmig.tasks WHERE status = 'done' AND v_status = 'mismatch'")
-  n=$(q "WITH u AS (UPDATE pgmig.tasks SET status = 'pending', redo = true WHERE status = 'done' AND v_status = 'mismatch' RETURNING 1) SELECT count(*) FROM u")
+  local n ids rc=0
+  if time_up; then log "이미 마감 시각$(dl_msg) -> 시작하지 않음"; return 3; fi
+  q "UPDATE pgmig.tasks SET status = 'pending', redo = true WHERE status = 'done' AND v_status = 'mismatch'" >/dev/null
+  # 이전 실행에서 마감으로 못 끝낸 재이관 청크도 같이
+  ids=$(q "SELECT coalesce(string_agg(DISTINCT table_id::text, ','), '') FROM pgmig.tasks WHERE redo AND status <> 'done'")
+  n=$(q "SELECT count(*) FROM pgmig.tasks WHERE redo AND status <> 'done'")
   if [ "$n" = "0" ]; then log "불일치 청크 없음"; return 0; fi
-  log "불일치 청크 ${n}개 재이관 (해당 범위 삭제 후 다시 적재)"
-  q "UPDATE pgmig.tasks SET status = 'pending' WHERE status IN ('running', 'failed')"
+  log "불일치 청크 ${n}개 재이관 (해당 범위 삭제 후 다시 적재$(dl_msg))"
+  reset_stale
   q "CALL pgmig.make_stage(true)"
-  run_workers "CALL pgmig.worker()" "$PROG_DATA"
+  load_chunks || rc=$?
+  [ $rc -eq 1 ] && return 1
   q "UPDATE pgmig.tasks SET v_status = 'pending' WHERE status = 'done' AND v_status IS NULL" >/dev/null
   # repair 는 FK/트리거를 끄고(session_replication_role=replica) 지웠다 넣으므로 고아 행 검사
   local orph
@@ -282,8 +360,50 @@ cmd_repair() {
   elif [ -n "$ids" ]; then
     log "FK 고아 행 없음 (재이관 테이블 관련 FK 검사)"
   fi
+  [ $rc -eq 3 ] && return 3
   log "재이관한 청크 재검증 (mode=$VERIFY_MODE)"
   do_verify "$VERIFY_MODE"
+}
+
+# 이관 기간(며칠~몇 주) 중 소스가 계속 바뀌는 경우의 따라잡기.  0 전부 일치 / 1 실패·불일치 남음 / 3 마감
+#   1) 분할 컬럼 범위 밖 신규 행: 적재가 끝난 마지막 청크를 닫고 그 뒤를 새 청크로 (catchup)
+#   2) 대기 청크 적재 (신규 청크 + 전날 마감으로 못 한 청크)
+#   3) 전 청크 재검증 (검증한 지 오래된 것부터 -> 시간 제한으로 며칠에 나눠 돌려도 한 바퀴 돎)
+#   4) 불일치 청크(기존 범위 안의 UPDATE/DELETE) 만 삭제 후 재이관 -> 재검증
+#   소스를 멈춘 뒤(컷오버) 마감 없이 한 번 더 돌리면 최종 정합성 확정
+cmd_sync() {
+  need_installed
+  [ "$(q "SELECT count(*) FROM pgmig.tasks")" != "0" ] || die "청크 없음 (schema 먼저)"
+  if time_up; then log "이미 마감 시각$(dl_msg) -> 시작하지 않음"; return 3; fi
+  local rc=0
+  log "sync: 이관 기간 중 소스 변경분 반영 (JOBS=$JOBS$(dl_msg))"
+  [ "$VERIFY_MODE" = full ] || log "주의: VERIFY_MODE=$VERIFY_MODE 는 건수만 비교 -> 값만 바뀐(UPDATE) 행은 못 잡음. sync 는 full 권장"
+  if [ "$(q "SELECT pgmig.cfg('ora_use_scn', 'off')")" = on ] && [ -z "${ORA_SCN:-}" ]; then
+    q "DELETE FROM pgmig.config WHERE key = 'ora_scn'" >/dev/null
+    log "ORA_USE_SCN=on: 새 SCN 시점으로 다시 읽음 (이전 SCN 은 undo 보존 기간이 지났을 수 있음)"
+  fi
+  q "CALL pgmig.make_stage(false)"
+
+  log "[1/4] 분할 컬럼 범위 밖 신규 행 -> 새 청크"
+  local out
+  out=$("${PSQL[@]}" -c "SELECT * FROM pgmig.catchup()")
+  printf '%s\n' "$out"
+  reset_stale
+
+  log "[2/4] 대기 청크 적재"
+  load_chunks || rc=$?
+  [ $rc -eq 0 ] || return $rc
+
+  log "[3/4] 전 청크 재검증 (mode=$VERIFY_MODE, 검증한 지 오래된 것부터)"
+  q "UPDATE pgmig.tasks SET v_status = 'pending' WHERE status = 'done' AND v_status IS DISTINCT FROM 'mismatch'" >/dev/null
+  do_verify "$VERIFY_MODE" || rc=$?
+  [ $rc -eq 3 ] && return 3
+  if [ $rc -eq 0 ]; then log "sync 완료: 전 청크 소스와 일치"; return 0; fi
+
+  log "[4/4] 불일치 청크 재이관"
+  rc=0; cmd_repair || rc=$?
+  [ $rc -eq 0 ] && log "sync 완료: 전 청크 소스와 일치"
+  return $rc
 }
 
 cmd_view() {
@@ -318,6 +438,12 @@ cmd_status() {
              (SELECT count(*) FROM pgmig.tasks WHERE v_status IN ('mismatch', 'error')) AS verify_bad,
              (SELECT count(*) FROM pgmig.ddl WHERE status = 'failed') AS ddl_failed
         FROM pgmig.tables"
+  qt "SELECT count(*) FILTER (WHERE status <> 'done') AS \"남은 청크\",
+             round(extract(epoch FROM avg(finished - started) FILTER (WHERE status = 'done'))) AS \"청크 평균(초)\",
+             round(count(*) FILTER (WHERE status <> 'done')
+                   * extract(epoch FROM avg(finished - started) FILTER (WHERE status = 'done')) / $JOBS / 60) AS \"남은 적재 예상(분, JOBS=$JOBS)\",
+             to_char(min(v_at) FILTER (WHERE status = 'done'), 'MM-DD HH24:MI') AS \"가장 오래된 검증\"
+        FROM pgmig.tasks"
   qt "SELECT phase, status, count(*) FROM pgmig.ddl GROUP BY 1, 2
       UNION ALL SELECT 'view', status, count(*) FROM pgmig.views GROUP BY 2 ORDER BY 1, 2"
 }
@@ -354,7 +480,7 @@ cmd_report() {
     echo "== 3. 제외된 테이블 =="
     qt "SELECT src_schema || '.' || src_table AS src, note FROM pgmig.tables WHERE NOT migrate ORDER BY 1"
     echo "== 4. 적재 실패 / 검증 불일치 청크 =="
-    qt "SELECT k.id AS task, pgmig.rel(k.table_id) AS tbl, pgmig.cond(k.pk_col, k.lo, k.hi) AS chunk, k.status,
+    qt "SELECT k.id AS task, pgmig.rel(k.table_id) AS tbl, pgmig.cond(k.pk_col, k.lo, k.hi, k.split_kind) AS chunk, k.status,
                coalesce(k.v_status, '-') AS verify, k.src_cnt, k.tgt_cnt, coalesce(k.error, k.v_error) AS error
           FROM pgmig.tasks k WHERE k.status <> 'done' OR k.v_status IN ('mismatch', 'error') ORDER BY k.id"
     echo "== 5. 파티션 테이블 =="
@@ -453,9 +579,14 @@ cmd_run() {
   installed || cmd_install
   cmd_analyze
   cmd_schema
-  cmd_data || die "데이터 이관 실패 -> 중단"
+  local rc=0
+  cmd_data || rc=$?
+  [ $rc -eq 3 ] && { log "마감으로 중단 -> 다음에 run(또는 data) 을 다시 실행하면 남은 청크부터"; exit 3; }
+  [ $rc -eq 0 ] || die "데이터 이관 실패 -> 중단"
   run_ddl_phase post1 "PK/UK/인덱스/CHECK/시퀀스/default/identity/코멘트 생성"
-  cmd_verify "$VERIFY_MODE" || { cmd_report; die "정합성 검증 실패 -> FK 생성 전 중단 (diff / repair 후 fk, report)"; }
+  cmd_verify "$VERIFY_MODE" || rc=$?
+  [ $rc -eq 3 ] && { log "마감으로 검증 중단 -> verify 를 다시 실행"; exit 3; }
+  [ $rc -eq 0 ] || { cmd_report; die "정합성 검증 실패 -> FK 생성 전 중단 (diff / repair 후 fk, report)"; }
   run_ddl_phase post2 "FK 생성"
   cmd_view
   cmd_report
@@ -463,11 +594,28 @@ cmd_run() {
 }
 
 cmd=$1; shift
+# 마감 옵션은 어느 위치에 와도 됨 (conf 의 UNTIL / MAX_MINUTES / STOP_BEFORE_MIN 보다 우선)
+ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --until)          [ $# -ge 2 ] || die "--until 값 필요"; UNTIL=$2; shift 2 ;;
+    --until=*)        UNTIL=${1#*=}; shift ;;
+    --max-minutes)    [ $# -ge 2 ] || die "--max-minutes 값 필요"; MAX_MINUTES=$2; shift 2 ;;
+    --max-minutes=*)  MAX_MINUTES=${1#*=}; shift ;;
+    --stop-before)    [ $# -ge 2 ] || die "--stop-before 값 필요"; STOP_BEFORE_MIN=$2; shift 2 ;;
+    --stop-before=*)  STOP_BEFORE_MIN=${1#*=}; shift ;;
+    *) ARGS+=("$1"); shift ;;
+  esac
+done
+set -- ${ARGS[@]+"${ARGS[@]}"}
+case "$cmd" in data|verify|repair|sync|run) set_deadline ;; esac
+
 case "$cmd" in
   install) cmd_install ;;
   analyze) cmd_analyze ;;
   schema)  cmd_schema ;;
   data)    cmd_data ;;
+  sync)    cmd_sync ;;
   index)   run_ddl_phase post1 "PK/UK/인덱스/CHECK/시퀀스/default/identity/코멘트 생성" ;;
   verify)  cmd_verify "$@" ;;
   diff)    cmd_diff "$@" ;;
