@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT
+-- Copyright (c) 2026 naturalTuna — https://github.com/naturalTuna/pgmig
 -- =====================================================================
 -- 시나리오 B: target(PostgreSQL) 데이터가 깨진 경우 -> verify 가 잡는지, repair 로 복구되는지
 --   실행 시점: verify 가 전부 OK 인 상태에서

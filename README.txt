@@ -299,3 +299,10 @@ sql/src_<type>.sql 에 아래 4개만 구현하면 core 는 그대로 씀.
     kind: NULL(숫자 PK) / num / time(lo/hi 는 epoch 초). 범위는 pgmig.cond(col, lo, hi, kind) 와 같아야 함
   (선택) FUNCTION pgmig.src_<type>_bounds(table_id, col, n, kind)  numeric[] 분위수 경계 (없으면 균등 분할)
 그리고 pgmig.sh 의 cmd_install 에 CREATE SERVER 옵션 한 줄 추가.
+
+
+9. 라이선스
+---------------------------------------------------------------------
+MIT License — Copyright (c) 2026 naturalTuna (https://github.com/naturalTuna/pgmig)
+저작권 표기와 라이선스 문구(LICENSE)를 남기면 누구나 사용·수정·재배포할 수 있음.
+코드 파일 상단의 SPDX-License-Identifier: MIT / Copyright 줄은 지우지 말 것.

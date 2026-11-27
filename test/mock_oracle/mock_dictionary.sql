@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT
+-- Copyright (c) 2026 naturalTuna — https://github.com/naturalTuna/pgmig
 -- =====================================================================
 -- Oracle 없이 pgmig Oracle 플러그인의 변환 로직을 점검하기 위한 가짜 딕셔너리
 --   test/oracle/01_oracle_testdata.sql 이 만드는 객체를 오라클 딕셔너리가 돌려줄 모양 그대로 흉내냄

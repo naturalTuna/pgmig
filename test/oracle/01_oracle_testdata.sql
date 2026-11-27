@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT
+-- Copyright (c) 2026 naturalTuna — https://github.com/naturalTuna/pgmig
 -- =====================================================================
 -- pgmig Oracle 테스트 데이터
 --   실행: sqlplus system/<비번>@//<호스트>:1521/<PDB 서비스명> @01_oracle_testdata.sql

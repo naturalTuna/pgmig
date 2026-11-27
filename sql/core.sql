@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT
+-- Copyright (c) 2026 naturalTuna — https://github.com/naturalTuna/pgmig
 -- =====================================================================
 -- pgmig core v0.2 : FDW 기반 anyDB -> PostgreSQL 마이그레이션 (소스 종류 무관 공통부)
 --   pgmig        : 제어 스키마 (카탈로그 사본, DDL 큐, 청크 태스크, 함수)

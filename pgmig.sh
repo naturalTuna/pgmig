@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 naturalTuna — https://github.com/naturalTuna/pgmig
 # =====================================================================
 # pgmig : FDW 기반 anyDB -> PostgreSQL 마이그레이션 (설치 -> 이관 -> 검증 -> 삭제)
 #   v0.2 소스: oracle (oracle_fdw), postgres (postgres_fdw, selftest 용)
