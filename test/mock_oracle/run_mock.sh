@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 naturalTuna — https://github.com/naturalTuna/pgmig
 # Oracle 없이 Oracle 플러그인 변환 로직(파티션/뷰/제약/default/가이드)을 점검
 #   가짜 딕셔너리(mock_dictionary.sql)로 analyze -> schema -> (데이터 흉내) -> index -> fk -> view -> report
 #   전제: PGHOST/PGPORT/PGUSER 로 접속 가능한 PostgreSQL (superuser)

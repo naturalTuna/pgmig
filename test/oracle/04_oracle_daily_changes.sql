@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT
+-- Copyright (c) 2026 naturalTuna — https://github.com/naturalTuna/pgmig
 -- =====================================================================
 -- 시나리오 D: 며칠에 나눠 이관하는 도중 소스(오라클)가 계속 바뀌는 경우 -> sync 가 따라잡는지
 --   실행 시점: README_TEST.txt 5-[D] 의 (3) 단계 (data 를 마감으로 일부만 돌린 뒤)

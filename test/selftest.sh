@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 naturalTuna — https://github.com/naturalTuna/pgmig
 # pgmig selftest : 오라클 없이 postgres_fdw 로 코어 흐름(이관/검증/불일치 탐지/재이관/삭제)을 점검
 #   전제: 실행 중인 PostgreSQL(superuser 접속, postgres_fdw 설치됨). PGHOST/PGPORT/PGUSER 환경변수 사용
 #   DB 두 개(pgmig_st_src, pgmig_st_tgt)를 만들었다가 끝나면 지움

@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT
+-- Copyright (c) 2026 naturalTuna — https://github.com/naturalTuna/pgmig
 -- =====================================================================
 -- pgmig 소스 플러그인 : Oracle (oracle_fdw)  v0.2
 --   카탈로그는 foreign table(서브쿼리) 로 읽어서 pgmig.oc_* 로컬 사본을 만든 뒤 정규화

@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT
+-- Copyright (c) 2026 naturalTuna — https://github.com/naturalTuna/pgmig
 -- =====================================================================
 -- 시나리오 A: 이관이 끝난 뒤 소스(오라클)가 바뀐 경우 -> verify 가 잡는지, repair 로 맞춰지는지
 --   실행 시점: ./pgmig.sh data (+ index, verify OK) 이후

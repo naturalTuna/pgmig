@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT
+-- Copyright (c) 2026 naturalTuna — https://github.com/naturalTuna/pgmig
 -- =====================================================================
 -- pgmig 소스 플러그인 : PostgreSQL (postgres_fdw)
 --   주 용도는 selftest (오라클 없이 코어 흐름 검증). PG -> PG 단순 이관에도 쓸 수는 있음

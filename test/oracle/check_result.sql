@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: MIT
+-- Copyright (c) 2026 naturalTuna — https://github.com/naturalTuna/pgmig
 -- =====================================================================
 -- 테스트 결과 자동 확인 (target PostgreSQL 에서 실행)
 --   실행 시점: ./pgmig.sh run (또는 data/index/verify/fk/view 까지) 끝난 뒤, 시나리오 A/B 전에, cleanup 전에

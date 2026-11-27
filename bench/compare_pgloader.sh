@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 naturalTuna — https://github.com/naturalTuna/pgmig
 # pgmig vs pgloader (PostgreSQL -> PostgreSQL, 같은 서버) 비교
 #   전제: PGHOST/PGPORT/PGUSER (superuser), postgres_fdw, pgloader 설치
 #   측정: 이관 시간, 원본 대비 행 해시 일치, 컬럼 타입 보존, 타깃 변조 시 탐지·부분 복구
